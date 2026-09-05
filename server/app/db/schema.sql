@@ -288,6 +288,38 @@ CREATE TABLE "chat_messages" (
 CREATE INDEX "chat_messages_session_id_created_at_idx" ON "chat_messages"("session_id", "created_at");
 
 -- ============================================================================
+-- Concierge conversation history (separate from chat_sessions/chat_messages
+-- above -- see the comment on ConciergeSession in app/db/models.py)
+-- ============================================================================
+
+CREATE TABLE "concierge_sessions" (
+    "id" TEXT NOT NULL,
+    "user_id" TEXT NOT NULL,
+    "title" TEXT,
+    "created_at" TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updated_at" TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "concierge_sessions_pkey" PRIMARY KEY ("id"),
+    CONSTRAINT "concierge_sessions_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "users"("id") ON DELETE CASCADE
+);
+
+CREATE INDEX "concierge_sessions_user_id_updated_at_idx" ON "concierge_sessions"("user_id", "updated_at" DESC);
+
+CREATE TABLE "concierge_messages" (
+    "id" TEXT NOT NULL,
+    "session_id" TEXT NOT NULL,
+    "role" TEXT NOT NULL,
+    "content" TEXT NOT NULL,
+    "meta" JSONB,
+    "created_at" TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "concierge_messages_pkey" PRIMARY KEY ("id"),
+    CONSTRAINT "concierge_messages_session_id_fkey" FOREIGN KEY ("session_id") REFERENCES "concierge_sessions"("id") ON DELETE CASCADE
+);
+
+CREATE INDEX "concierge_messages_session_id_created_at_idx" ON "concierge_messages"("session_id", "created_at");
+
+-- ============================================================================
 -- Personal Legal Calendar (Phase 4)
 -- ============================================================================
 

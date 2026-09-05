@@ -470,6 +470,44 @@ def ensure_orders_idempotency_and_refund_columns(engine: Engine) -> None:
         )
 
 
+def ensure_concierge_history_tables(engine: Engine) -> None:
+    """Per-user concierge conversation history: concierge_sessions +
+    concierge_messages. Kept separate from chat_sessions/chat_messages -- see
+    the comment on ConciergeSession in app/db/models.py."""
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE IF NOT EXISTS concierge_sessions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                title TEXT,
+                created_at TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS concierge_sessions_user_id_updated_at_idx "
+            "ON concierge_sessions(user_id, updated_at DESC);"
+        )
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE IF NOT EXISTS concierge_messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES concierge_sessions(id) ON DELETE CASCADE,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                meta JSONB,
+                created_at TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS concierge_messages_session_id_created_at_idx "
+            "ON concierge_messages(session_id, created_at);"
+        )
+
+
 def run_migrations(engine: Engine) -> None:
     """Called unconditionally from init_db() after schema.sql (or on every
     run against an existing DB). Order matters: parent tables/columns first."""
@@ -486,5 +524,6 @@ def run_migrations(engine: Engine) -> None:
     ensure_calendar_events_related_case_event_column(engine)
     ensure_chat_tables(engine)
     ensure_chat_messages_language_columns(engine)
+    ensure_concierge_history_tables(engine)
     ensure_commerce_tables(engine)
     ensure_orders_idempotency_and_refund_columns(engine)

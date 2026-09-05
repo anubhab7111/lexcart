@@ -508,6 +508,72 @@ class ChatMessage(SQLModel, table=True):
 
 
 # ============================================================================
+# Concierge conversation history
+#
+# Deliberately separate from ChatSession/ChatMessage above rather than
+# reusing them: the LangGraph chatbot's in-memory session cache
+# (LegalChatbot._sessions) and its DB seed/restore logic share the chat_*
+# id space, and the concierge has its own role vocabulary (user/agent, not
+# user/assistant/system) and per-turn structured extras (lawyer cards) that
+# don't fit the chat schema.
+# ============================================================================
+
+
+class ConciergeSession(SQLModel, table=True):
+    __tablename__ = "concierge_sessions"
+
+    # Caller-supplied session_id (the same id commerce.concierge._sessions is
+    # keyed by) — not auto-generated, so the in-memory selection state and
+    # the durable row share one id.
+    id: str = Field(primary_key=True)
+    user_id: str = Field(foreign_key="users.id")
+    title: Optional[str] = None
+    created_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), server_default=func.now()),
+    )
+    updated_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), server_default=func.now()),
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "userId": self.user_id,
+            "title": self.title,
+            "createdAt": self.created_at.isoformat() if self.created_at else None,
+            "updatedAt": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class ConciergeMessage(SQLModel, table=True):
+    __tablename__ = "concierge_messages"
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    session_id: str = Field(foreign_key="concierge_sessions.id")
+    # Plain string, not an enum -- matches the concierge's own "user"/"agent"
+    # role vocabulary used throughout commerce/concierge.py and the client,
+    # rather than mapping onto MessageRole's "assistant".
+    role: str
+    content: str
+    # {"lawyers": [Lawyer.to_dict(), ...]} for an agent turn that showed
+    # recommendation cards; null otherwise.
+    meta: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB))
+    created_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), server_default=func.now()),
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            "role": self.role,
+            "content": self.content,
+            "meta": self.meta,
+        }
+
+
+# ============================================================================
 # Personal Legal Calendar (Phase 4)
 # ============================================================================
 

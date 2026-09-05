@@ -56,6 +56,13 @@ def _get_session_state(session_id: str, user_id: str) -> ConciergeSession:
     return state
 
 
+def forget_session(session_id: str) -> None:
+    """Drop a session's in-memory selection state (lawyer/addons/last
+    results). Used when a conversation's durable history row is deleted, so
+    a since-deleted session_id doesn't keep silently reusing stale state."""
+    _sessions.pop(session_id, None)
+
+
 # ── Intent parsing ──────────────────────────────────────────────────────────
 
 _PARSE_PROMPT = """You are the intent parser for a legal-services shopping assistant.

@@ -11,22 +11,7 @@ import {
   type ChatSessionSummary,
 } from "../api";
 import { RichText } from "./RichText";
-import { initials, avatarTint, type UserProfile } from "../lib/ui";
-
-// crypto.randomUUID is only defined in secure contexts (https:// or
-// localhost) — a demo reached over a bare http://<lan-ip> origin (a phone,
-// a second laptop, a projector machine) would otherwise throw here on every
-// single message send.
-function uuid(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0;
-    const v = c === "x" ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
-  });
-}
+import { initials, avatarTint, uuid, type UserProfile } from "../lib/ui";
 
 interface Message {
   id: string;

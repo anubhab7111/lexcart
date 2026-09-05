@@ -561,6 +561,21 @@ export interface ConciergeReply {
     proposal: ConciergeProposal | null;
     suggestions: string[];
     mock: boolean;
+    sessionId: string;
+}
+
+export interface ConciergeSessionSummary {
+    id: string;
+    userId: string;
+    title: string | null;
+    createdAt: string;
+    updatedAt: string;
+}
+
+export interface ConciergeHistoryMessage {
+    role: 'user' | 'agent';
+    content: string;
+    meta: { lawyers?: Lawyer[] } | null;
 }
 
 export interface ServiceAddon {
@@ -586,6 +601,22 @@ export async function conciergeConfirm(sessionId: string, proposalId: string): P
 
 export async function conciergeReject(sessionId: string, proposalId: string) {
     return postJson('/concierge/reject', { sessionId, proposalId });
+}
+
+/** List the current user's persisted concierge conversations, most recent first. */
+export async function listConciergeSessions(): Promise<{ sessions: ConciergeSessionSummary[]; count: number }> {
+    return requestJson('/concierge/sessions');
+}
+
+/** Full transcript for a concierge conversation the current user owns. */
+export async function getConciergeSessionHistory(
+    sessionId: string,
+): Promise<{ sessionId: string; messages: ConciergeHistoryMessage[]; count: number }> {
+    return requestJson(`/concierge/session/${sessionId}/history`);
+}
+
+export async function clearConciergeSession(sessionId: string): Promise<{ message: string }> {
+    return requestJson(`/concierge/session/${sessionId}`, { method: 'DELETE' });
 }
 
 export interface AgentAuditEntry {
