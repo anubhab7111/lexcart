@@ -18,6 +18,7 @@ Design principles
 """
 
 import asyncio
+import time
 import json
 import math
 import pickle
@@ -230,21 +231,36 @@ async def _get_shared_embeddings() -> Any:
 
 
 _shared_reranker: Optional[Any] = None
-_shared_reranker_failed: bool = False
+# Timestamp of the last load failure, not a permanent bool -- a transient
+# failure (model server hiccup, momentary OOM) used to latch forever and
+# degrade every subsequent query to fused-order retrieval for the rest of
+# the process's life with no way to recover. None means "never failed, or
+# cooldown has elapsed and a retry is due".
+_shared_reranker_failed_at: Optional[float] = None
+_RERANKER_RETRY_COOLDOWN_SECONDS = 300
 _shared_reranker_lock = asyncio.Lock()
+
+
+def _reranker_load_on_cooldown() -> bool:
+    return (
+        _shared_reranker_failed_at is not None
+        and time.time() - _shared_reranker_failed_at < _RERANKER_RETRY_COOLDOWN_SECONDS
+    )
 
 
 async def _get_shared_reranker() -> Optional[Any]:
     """
     Shared cross-encoder reranker (same singleton pattern as the embeddings).
     Returns None if the model can't be loaded — callers must degrade to the
-    fused-retrieval ordering in that case.
+    fused-retrieval ordering in that case. Retries after
+    _RERANKER_RETRY_COOLDOWN_SECONDS rather than latching the failure
+    forever.
     """
-    global _shared_reranker, _shared_reranker_failed
-    if _shared_reranker is not None or _shared_reranker_failed:
+    global _shared_reranker, _shared_reranker_failed_at
+    if _shared_reranker is not None or _reranker_load_on_cooldown():
         return _shared_reranker
     async with _shared_reranker_lock:
-        if _shared_reranker is not None or _shared_reranker_failed:
+        if _shared_reranker is not None or _reranker_load_on_cooldown():
             return _shared_reranker
         try:
             from sentence_transformers import CrossEncoder
@@ -271,7 +287,7 @@ async def _get_shared_reranker() -> Optional[Any]:
                     pass
 
             model_name = get_settings().reranker_model
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             try:
                 _shared_reranker = await loop.run_in_executor(
                     None,
@@ -287,9 +303,13 @@ async def _get_shared_reranker() -> Optional[Any]:
                     lambda: CrossEncoder(model_name, device=device, max_length=512),
                 )
             print(f"[rag] Reranker loaded: {model_name} on {device}")
+            _shared_reranker_failed_at = None
         except Exception as e:
-            _shared_reranker_failed = True
-            print(f"[rag] Reranker unavailable ({e}) — falling back to fused order.")
+            _shared_reranker_failed_at = time.time()
+            print(
+                f"[rag] Reranker unavailable ({e}) — falling back to fused order "
+                f"for {_RERANKER_RETRY_COOLDOWN_SECONDS}s."
+            )
         return _shared_reranker
 
 
@@ -407,7 +427,7 @@ async def compress_chunks_for_context(
     if not pairs:
         return chunks
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         logits = await loop.run_in_executor(
             None, lambda: reranker.predict(pairs, batch_size=16)
@@ -648,7 +668,7 @@ class BaseLegalRAGSystem(ABC):
         `search_query` may be keyword-expanded; `rerank_query` should be the
         natural-language query, which cross-encoders score more reliably.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         domain_set = set(domains) if domains else None
 
         def _md_domains(md: Dict[str, Any]) -> List[str]:
@@ -684,10 +704,18 @@ class BaseLegalRAGSystem(ABC):
         if self._bm25 is not None:
             tokens = _bm25_tokenize(search_query)
             if tokens:
-                scores = self._bm25.get_scores(tokens)
-                order = sorted(
-                    range(len(scores)), key=lambda i: scores[i], reverse=True
-                )
+                # get_scores is a synchronous numpy scan over the *entire*
+                # BM25 corpus -- unlike every other retrieval stage here
+                # (dense search, reranking), this ran inline on the event
+                # loop, serializing concurrent chat requests behind it.
+                bm25 = self._bm25
+
+                def _bm25_score():
+                    scores = bm25.get_scores(tokens)
+                    order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+                    return scores, order
+
+                scores, order = await loop.run_in_executor(None, _bm25_score)
                 rank = 0
                 for idx in order:
                     if scores[idx] <= 0 or rank >= candidate_pool:
@@ -1076,7 +1104,7 @@ class BaseLegalRAGSystem(ABC):
             f"[{self.domain_name}] Embedding {len(documents)} documents … "
             f"(this may take several minutes)"
         )
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         self.vector_store = await loop.run_in_executor(
             None, lambda: FAISS.from_documents(documents, self.embeddings)
         )
@@ -1167,7 +1195,7 @@ class BaseLegalRAGSystem(ABC):
         from app.config import get_settings
 
         self._faiss_dir.mkdir(parents=True, exist_ok=True)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             None,
             lambda: self.vector_store.save_local(str(self._faiss_dir)),
@@ -1186,7 +1214,7 @@ class BaseLegalRAGSystem(ABC):
     async def _load_vectorstore(self):
         """Load FAISS index from disk."""
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             self.vector_store = await loop.run_in_executor(
                 None,
                 lambda: FAISS.load_local(

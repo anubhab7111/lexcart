@@ -10,13 +10,16 @@ Invariants enforced here, not in routers:
 """
 
 import math
+import zlib
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.commerce.audit import log_action
-from app.commerce.guardrails import BoundsResult, check_order_bounds
+from app.commerce.guardrails import AGENT_CHANNELS, BoundsResult, check_order_bounds
 from app.db.models import (
     Booking,
     BookingStatus,
@@ -27,7 +30,7 @@ from app.db.models import (
     OrderStatus,
     ServiceAddon,
 )
-from app.services.razorpay_gateway import get_gateway
+from app.services.razorpay_gateway import PaymentGatewayError, get_gateway
 
 PLATFORM_FEE_RATE = 0.05
 
@@ -119,6 +122,21 @@ def create_order(
 ) -> Tuple[Order, dict]:
     """Bounds-check the priced cart, create the Razorpay order, persist our
     Order row, and audit — or audit the refusal and raise BoundsExceeded."""
+    if channel in AGENT_CHANNELS:
+        # Serialize concurrent bounds-check + insert for the same actor
+        # scope. Without this, two concurrent agent orders for the same
+        # user/key can each run check_order_bounds's SUM query before
+        # either has inserted its own order, both see the same "spent so
+        # far" total, and both pass the daily cap even though together
+        # they exceed it. pg_advisory_xact_lock is transaction-scoped: it
+        # releases automatically on this function's session.commit() (or
+        # on rollback if bounds fail), so no explicit unlock is needed,
+        # and it only blocks other callers sharing the same scope key —
+        # unrelated actors aren't serialized against each other.
+        lock_scope = agent_key_id or user_id or channel
+        lock_key = zlib.crc32(f"order_bounds:{lock_scope}".encode()) & 0x7FFFFFFF
+        session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": lock_key})
+
     bounds = check_order_bounds(
         session,
         cart.total_inr,
@@ -157,15 +175,34 @@ def create_order(
         agent_key_id=agent_key_id,
         buyer_reference=buyer_reference,
     )
-    rzp_order = gateway.create_order(
-        cart.total_inr,
-        receipt=order.id,
-        notes={
-            "channel": channel,
-            "lawyer": cart.lawyer.name,
-            "userId": user_id or "",
-        },
-    )
+    try:
+        rzp_order = gateway.create_order(
+            cart.total_inr,
+            receipt=order.id,
+            notes={
+                "channel": channel,
+                "lawyer": cart.lawyer.name,
+                "userId": user_id or "",
+            },
+        )
+    except PaymentGatewayError as e:
+        # Nothing was persisted yet (order.id only exists in memory as the
+        # Razorpay receipt), but a money-action failure still needs an
+        # audit row -- "every action bounded, gated, audited" includes the
+        # ones that fail, not just the ones that succeed.
+        log_action(
+            session,
+            actor,
+            "order_failed",
+            actor_ref=actor_ref,
+            user_id=user_id,
+            rationale=f"Razorpay order creation failed: {e}",
+            amount_inr=cart.total_inr,
+            bounds_check=bounds.audit_value,
+            gate_status=gate_status,
+            detail={"lawyerId": cart.lawyer.id, "error": str(e)},
+        )
+        raise
     order.razorpay_order_id = rzp_order["id"]
     session.add(order)
     session.commit()
@@ -197,6 +234,21 @@ class PaymentVerificationError(Exception):
     pass
 
 
+class OrderAlreadyProcessed(Exception):
+    """Raised when confirm_payment finds, under a row lock, that a
+    concurrent caller already resolved this order. Three surfaces can all
+    reach confirm_payment for the same order -- the client-side /verify
+    callback, an agent's pay-mock call, and the Razorpay webhook safety
+    net -- and each has its own read-then-act status check with a TOCTOU
+    gap before it ever calls this function. This is not a user error:
+    callers should look up the order's current state and reply with that
+    outcome instead of treating it as a failure."""
+
+    def __init__(self, order: Order):
+        super().__init__(f"Order {order.id} is already {order.status.value}")
+        self.order = order
+
+
 def confirm_payment(
     session: Session,
     order: Order,
@@ -218,6 +270,27 @@ def confirm_payment(
     reconciling a payment the client-side callback may never have reached
     the server for.
     """
+    # Atomically claim the order row under a lock before doing anything
+    # else. Every caller of this function has already read order.status in
+    # its own transaction and decided it looked like "created" -- but that
+    # read is not the gate, because three different surfaces can race to
+    # get here for the same order (see OrderAlreadyProcessed above).
+    #
+    # session.refresh(..., with_for_update=True) rather than a plain
+    # `select(...).with_for_update()`: the caller's `order` object is
+    # already attached to this session's identity map (every real call
+    # site loads it on the same session it hands to this function), and a
+    # plain SELECT re-run on a session that already has that row loaded
+    # blocks correctly at the DB level but then hands back the *cached*
+    # Python object without overwriting its already-loaded attributes --
+    # so a concurrent caller can unblock, still see the stale
+    # status="created" it read before waiting, and double-process anyway.
+    # refresh() is the one Session API that forces an unconditional
+    # attribute overwrite from the freshly (lock-)fetched row.
+    session.refresh(order, with_for_update=True)
+    if order.status != OrderStatus.created:
+        raise OrderAlreadyProcessed(order)
+
     gateway = get_gateway()
     if not pre_verified and not gateway.verify_payment_signature(
         order.razorpay_order_id, payment_id, signature
@@ -260,7 +333,37 @@ def confirm_payment(
         # service that was never delivered, and say so plainly.
         session.rollback()
         order = session.get(Order, order.id)
-        refund = gateway.refund_payment(payment_id, order.total_amount_inr)
+        try:
+            refund = gateway.refund_payment(payment_id, order.total_amount_inr)
+        except PaymentGatewayError as refund_err:
+            # The worst case: money was captured, the booking failed, and
+            # the automatic refund also failed at the gateway. Leave the
+            # order in a distinctly-flagged, unmistakably-broken state
+            # (not silently "created", not incorrectly "refunded") and
+            # audit both failures so this is findable, not lost to a
+            # stack trace.
+            order.failure_reason = (
+                f"booking creation failed post-capture ({e}) AND the automatic "
+                f"refund also failed ({refund_err}) — payment was captured but "
+                "neither delivered nor refunded; needs manual reconciliation"
+            )
+            session.add(order)
+            log_action(
+                session, actor, "refund_failed",
+                actor_ref=actor_ref, user_id=order.user_id,
+                rationale=order.failure_reason,
+                amount_inr=order.total_amount_inr, order_id=order.id,
+                detail={
+                    "razorpayPaymentId": payment_id,
+                    "bookingError": str(e),
+                    "refundError": str(refund_err),
+                },
+            )
+            raise PaymentVerificationError(
+                "Payment was captured but we couldn't complete the booking or the "
+                "automatic refund. This has been flagged for manual review — please "
+                "contact support with your payment id."
+            ) from refund_err
         order.status = OrderStatus.refunded
         order.razorpay_refund_id = refund["id"]
         order.failure_reason = f"booking creation failed post-capture: {e}"
@@ -328,7 +431,17 @@ def refund_order(
         raise CartError(f"Order is {order.status.value}, not paid — nothing to refund")
 
     gateway = get_gateway()
-    refund = gateway.refund_payment(order.razorpay_payment_id, order.total_amount_inr)
+    try:
+        refund = gateway.refund_payment(order.razorpay_payment_id, order.total_amount_inr)
+    except PaymentGatewayError as e:
+        log_action(
+            session, actor, "refund_failed",
+            actor_ref=actor_ref, user_id=order.user_id,
+            rationale=f"cancellation requested but the gateway refund failed: {e}",
+            amount_inr=order.total_amount_inr, order_id=order.id,
+            detail={"razorpayPaymentId": order.razorpay_payment_id, "error": str(e)},
+        )
+        raise
     order.status = OrderStatus.refunded
     order.razorpay_refund_id = refund["id"]
     session.add(order)
@@ -396,7 +509,22 @@ def confirm_campaign_link_payment(
         campaign_id=campaign.id,
     )
     session.add(order)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError:
+        # The read-then-write dedup check above (`existing = ...`) has a
+        # race window: two duplicate webhook deliveries for the same
+        # payment can both miss it and both reach this insert. The unique
+        # index on razorpay_payment_id turns the loser's insert into this
+        # IntegrityError instead of a second order+booking — recover by
+        # returning whichever row actually won.
+        session.rollback()
+        existing = session.exec(
+            select(Order).where(Order.razorpay_payment_id == razorpay_payment_id)
+        ).first()
+        if existing:
+            return existing
+        raise
 
     booking = Booking(
         user_id=buyer_user_id,

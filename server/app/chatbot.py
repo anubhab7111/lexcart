@@ -7,7 +7,6 @@ import asyncio
 import time
 import contextvars
 import re
-from asyncio.events import AbstractEventLoop
 from functools import lru_cache
 from typing import (
     Any,
@@ -244,12 +243,19 @@ _INCOMPLETE_GENERATION_NOTE = (
 
 
 async def invoke_llm_safely(
-    llm: ChatOllama, prompt: str, stream: bool = True
+    llm: ChatOllama, prompt: str, stream: bool = True, timeout_seconds: Optional[float] = None
 ) -> str:
     """Safely invoke LLM with proper error handling. Supports streaming via
     context queue. Pass stream=False for internal/auxiliary calls (e.g. the
     grounding fact-checker) whose raw output must never reach the user's
     token stream even when called from within a streaming handler task.
+
+    timeout_seconds overrides the default _LLM_TIMEOUT_SECONDS (120s) --
+    ChatOllama's own constructor `timeout=` kwarg is a silent no-op (see
+    _LLM_TIMEOUT_SECONDS below), so without this override every caller is
+    bounded at 120s regardless of which of get_llm()/get_fast_llm() they
+    pass, even ones that only ever need a quick classification and should
+    fail fast instead of hanging a whole turn for two minutes.
 
     Every model here runs with reasoning=False (see get_llm()), so a
     thinking preamble arrives inline in the token stream ending with a
@@ -266,6 +272,7 @@ async def invoke_llm_safely(
     showing that verbatim would leak internal monologue/drafts to the user.
     """
     queue = _stream_queue_var.get(None) if stream else None
+    effective_timeout = timeout_seconds if timeout_seconds is not None else _LLM_TIMEOUT_SECONDS
 
     if queue is not None:
         # Streaming mode - use astream and push chunks to queue, filtering
@@ -318,44 +325,55 @@ async def invoke_llm_safely(
             return visible_response
 
         try:
-            return await asyncio.wait_for(_drain(), timeout=_LLM_TIMEOUT_SECONDS)
+            return await asyncio.wait_for(_drain(), timeout=effective_timeout)
         except asyncio.TimeoutError:
             # Same treatment as a user-initiated Stop: keep whatever was
             # already streamed to the client rather than discarding it.
             note = "\n\n*(Response generation took too long and was cut short.)*"
             visible_response += note
             await queue.put(note)
-            print(f"[LLM] generation exceeded {_LLM_TIMEOUT_SECONDS}s, returning partial output")
+            print(f"[LLM] generation exceeded {effective_timeout}s, returning partial output")
             return visible_response
         except Exception as e:
             print(f"LLM streaming error: {e}")
             raise
     else:
-        # Normal (non-streaming) mode
-        try:
-            loop: AbstractEventLoop = asyncio.get_event_loop()
-            response = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None, lambda: llm.invoke([HumanMessage(content=prompt)])
-                ),
-                timeout=_LLM_TIMEOUT_SECONDS,
-            )
-            raw = response.content
-            if "</think>" not in raw:
-                # Never closed the thinking phase — raw is entirely internal
-                # monologue, not an answer (see docstring).
-                print(
-                    f"[LLM] non-streaming generation ended without </think> "
-                    f"({len(raw)} chars) — giving up"
+        # Normal (non-streaming) mode. One retry on a genuine invocation
+        # error (connection blip to the local Ollama server is the common
+        # real-world case) -- not on asyncio.TimeoutError, which already
+        # means the model was generating and just took too long, where
+        # retrying would only double the wait for the same outcome.
+        loop = asyncio.get_running_loop()
+        last_error: Optional[Exception] = None
+        for attempt in range(2):
+            try:
+                response = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, lambda: llm.invoke([HumanMessage(content=prompt)])
+                    ),
+                    timeout=effective_timeout,
                 )
-                return _INCOMPLETE_GENERATION_NOTE
-            return strip_reasoning_tags(raw)
-        except asyncio.TimeoutError:
-            print(f"[LLM] generation exceeded {_LLM_TIMEOUT_SECONDS}s")
-            raise
-        except Exception as e:
-            print(f"LLM invocation error: {e}")
-            raise
+                raw = response.content
+                if "</think>" not in raw:
+                    # Never closed the thinking phase — raw is entirely
+                    # internal monologue, not an answer (see docstring).
+                    print(
+                        f"[LLM] non-streaming generation ended without </think> "
+                        f"({len(raw)} chars) — giving up"
+                    )
+                    return _INCOMPLETE_GENERATION_NOTE
+                return strip_reasoning_tags(raw)
+            except asyncio.TimeoutError:
+                print(f"[LLM] generation exceeded {effective_timeout}s")
+                raise
+            except Exception as e:
+                last_error = e
+                if attempt == 0:
+                    print(f"LLM invocation error (retrying once): {e}")
+                    await asyncio.sleep(0.5)
+                    continue
+                print(f"LLM invocation error: {e}")
+                raise last_error
 
 
 # ============================================================================
@@ -431,7 +449,7 @@ async def _rewrite_query_for_retrieval(
     )
 
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         response = await asyncio.wait_for(
             loop.run_in_executor(
                 None, lambda: get_fast_llm().invoke([HumanMessage(content=prompt)])
@@ -521,7 +539,29 @@ async def classify_intent(state: ChatState) -> ChatState:
     # non_legal) — no separate keyword-based domain gate. non_legal is a
     # real competing class here, not a hardcoded-pattern fallback.
     # =========================================================================
-    result = await classify_intent_embedding(user_input, has_document)
+    try:
+        result = await classify_intent_embedding(user_input, has_document)
+    except Exception as e:
+        # Routing had no fallback at all if the embedding model itself is
+        # unavailable (a genuine outage, not a low-confidence read) --
+        # unhandled, this exception propagates out of graph.ainvoke and
+        # the whole turn 500s. Degrade to the same safe default already
+        # used for low-confidence/ambiguous ties (general_query, still
+        # grounded) instead; has_document doesn't need an embedding to be
+        # a strong signal on its own.
+        print(f"[Router] embedding classifier unavailable ({e}) — defaulting")
+        fallback_intent = "document_analysis" if has_document else "general_query"
+        return {
+            **state,
+            "intent": fallback_intent,
+            "routing_confidence": 0.0,
+            "routing_reasoning": f"embedding classifier unavailable ({e}); defaulted to {fallback_intent}",
+            "is_ambiguous": True,
+            "selected_tools": INTENT_TOOL_MAP.get(fallback_intent, []),
+            "domain_hint": None,
+            "retrieval_query": user_input,
+            "active_document_context": has_document,
+        }
     # Ambiguous ties among the four *legal* intents default to general_query
     # (still grounded, just not the specific handler) rather than falling
     # back to an LLM — no model call anywhere in this routing path. But if
@@ -551,7 +591,7 @@ async def classify_intent(state: ChatState) -> ChatState:
             "active_document_context": has_document,
         }
 
-    domain_hint = await classify_domain_hint_embedding(user_input)
+    domain_hint = await classify_domain_hint_embedding(user_input, query_vec=result.query_vec)
     entities = _extract_legal_entities(user_input)
     print(
         f"[Router] Decision: intent={intent}, confidence={result.confidence:.3f}, "
@@ -1041,7 +1081,7 @@ async def handle_general_query(state: ChatState) -> ChatState:
     is_multi_offense = crime_count >= 2
 
     async def _fast_llm_invoke(prompt: str) -> str:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         response = await asyncio.wait_for(
             loop.run_in_executor(
                 None, lambda: get_fast_llm().invoke([HumanMessage(content=prompt)])

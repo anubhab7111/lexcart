@@ -470,6 +470,31 @@ def ensure_orders_idempotency_and_refund_columns(engine: Engine) -> None:
         )
 
 
+def ensure_orders_payment_idempotency_indexes(engine: Engine) -> None:
+    """Turn two read-then-write idempotency checks into DB-enforced
+    guarantees. agent_create_order's buyerReference dedup and
+    confirm_campaign_link_payment's razorpay_payment_id dedup both read
+    then insert, which races under concurrent retries / duplicate webhook
+    deliveries -- a plain (non-unique) index doesn't stop a duplicate row.
+    Replaces the plain orders_agent_key_id_buyer_reference_idx (added by
+    ensure_orders_idempotency_and_refund_columns) with a unique one, and
+    adds a new unique partial index on razorpay_payment_id. Callers catch
+    IntegrityError on the resulting duplicate insert and return the row
+    that won the race instead of erroring."""
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "DROP INDEX IF EXISTS orders_agent_key_id_buyer_reference_idx;"
+        )
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS orders_agent_key_id_buyer_reference_key "
+            "ON orders(agent_key_id, buyer_reference) WHERE buyer_reference IS NOT NULL;"
+        )
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS orders_razorpay_payment_id_key "
+            "ON orders(razorpay_payment_id) WHERE razorpay_payment_id IS NOT NULL;"
+        )
+
+
 def ensure_concierge_history_tables(engine: Engine) -> None:
     """Per-user concierge conversation history: concierge_sessions +
     concierge_messages. Kept separate from chat_sessions/chat_messages -- see
@@ -527,3 +552,4 @@ def run_migrations(engine: Engine) -> None:
     ensure_concierge_history_tables(engine)
     ensure_commerce_tables(engine)
     ensure_orders_idempotency_and_refund_columns(engine)
+    ensure_orders_payment_idempotency_indexes(engine)

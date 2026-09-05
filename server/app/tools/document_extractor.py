@@ -6,8 +6,12 @@ Unified tool that combines text extraction and Tesseract OCR.
 
 import io
 import os
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 import asyncio
+
+from cachetools import TTLCache
+
+from app.config import get_settings
 
 # OCR processing
 try:
@@ -89,7 +93,12 @@ class DocumentExtractor:
     MAX_IMAGE_SIZE = (3000, 3000)  # Resize large images for faster OCR
 
     def __init__(self, tesseract_cmd: Optional[str] = None):
-        self._cache = {}
+        # Bounded + TTL'd rather than a plain dict, matching
+        # IndianKanoonClient's cache -- defensive against unbounded growth
+        # on a long-running single worker if this starts getting populated.
+        self._cache: "TTLCache[str, Any]" = TTLCache(
+            maxsize=256, ttl=get_settings().cache_ttl_seconds
+        )
         self._ocr_available = False
 
         if HAS_PYTESSERACT:

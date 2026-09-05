@@ -34,6 +34,7 @@ Key design decisions
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -672,11 +673,17 @@ class CriminalRAGSystem(BaseLegalRAGSystem):
 # ─────────────────────────────────────────────────────────────
 
 _criminal_rag: Optional[CriminalRAGSystem] = None
+_criminal_rag_lock = threading.Lock()
 
 
 def get_criminal_rag_system() -> CriminalRAGSystem:
-    """Get or create the CriminalRAGSystem singleton."""
+    """Get or create the CriminalRAGSystem singleton. Locked (see
+    unified_legal_rag.get_unified_rag_system's docstring for why a plain
+    check-then-construct here is a real race under concurrency)."""
     global _criminal_rag
-    if _criminal_rag is None:
-        _criminal_rag = CriminalRAGSystem()
-    return _criminal_rag
+    if _criminal_rag is not None:
+        return _criminal_rag
+    with _criminal_rag_lock:
+        if _criminal_rag is None:
+            _criminal_rag = CriminalRAGSystem()
+        return _criminal_rag

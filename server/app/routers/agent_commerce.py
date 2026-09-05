@@ -17,12 +17,14 @@ from fastapi import APIRouter, Depends, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import func as safunc
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.commerce.audit import log_action
 from app.commerce.orders import (
     BoundsExceeded,
     CartError,
+    OrderAlreadyProcessed,
     PaymentVerificationError,
     confirm_payment,
     create_order,
@@ -39,7 +41,7 @@ from app.db.models import (
     ServiceAddon,
 )
 from app.deps.errors import MessageHTTPException
-from app.services.razorpay_gateway import get_gateway
+from app.services.razorpay_gateway import PaymentGatewayError, get_gateway
 
 router = APIRouter(tags=["agent-commerce"])
 
@@ -58,9 +60,15 @@ def get_agent_key(
     key = session.exec(select(AgentApiKey).where(AgentApiKey.key_hash == key_hash)).first()
     if key is None or not key.active:
         raise MessageHTTPException(status_code=401, detail="Invalid or inactive agent key")
-    key.last_used_at = datetime.now(timezone.utc)
-    session.add(key)
-    session.commit()
+    now = datetime.now(timezone.utc)
+    # Throttled: this dependency runs on every agent-API call, so writing
+    # last_used_at unconditionally is a DB write on the hot path for no
+    # real benefit -- a minute's staleness on a "last used" display is
+    # unnoticeable.
+    if key.last_used_at is None or (now - key.last_used_at) > timedelta(seconds=60):
+        key.last_used_at = now
+        session.add(key)
+        session.commit()
     return key
 
 
@@ -184,18 +192,17 @@ class AgentOrderRequest(BaseModel):
 
 
 def _key_spend_24h(session: Session, key_id: str) -> int:
-    """Paid orders in the last 24h plus still-open orders from the last
-    hour, so a key can't dodge its daily limit by leaving orders unpaid."""
+    """Paid orders in the last 24h plus still-open orders from the same 24h
+    window, so a key can't dodge its daily limit by leaving orders unpaid
+    past a short "still open" cutoff (mirrors guardrails.check_order_bounds's
+    windowing, which has the same reasoning)."""
     since = datetime.now(timezone.utc) - timedelta(days=1)
-    since_open = datetime.now(timezone.utc) - timedelta(hours=1)
     return int(
         session.exec(
             select(safunc.coalesce(safunc.sum(Order.total_amount_inr), 0))
             .where(Order.agent_key_id == key_id)
-            .where(
-                ((Order.status == OrderStatus.paid) & (Order.created_at >= since))
-                | ((Order.status == OrderStatus.created) & (Order.created_at >= since_open))
-            )
+            .where(Order.created_at >= since)
+            .where(Order.status.in_([OrderStatus.paid, OrderStatus.created]))
         ).one()
     )
 
@@ -265,6 +272,39 @@ def agent_create_order(
         )
     except BoundsExceeded as e:
         return JSONResponse(status_code=400, content={"message": e.result.reason})
+    except PaymentGatewayError:
+        return JSONResponse(
+            status_code=502,
+            content={"message": "The payment gateway is temporarily unavailable — please try again."},
+        )
+    except IntegrityError:
+        # The read-then-write idempotency check above raced with a
+        # concurrent duplicate request for the same buyerReference and both
+        # passed it; the unique DB index caught the second insert. Recover
+        # by returning the row that actually won, same shape as the
+        # pre-check above.
+        session.rollback()
+        if body.buyerReference:
+            existing = session.exec(
+                select(Order)
+                .where(Order.agent_key_id == key.id)
+                .where(Order.buyer_reference == body.buyerReference)
+            ).first()
+            if existing is not None:
+                gateway = get_gateway()
+                return {
+                    "orderId": existing.id,
+                    "status": existing.status.value,
+                    "totalInr": existing.total_amount_inr,
+                    "currency": "INR",
+                    "payment": {
+                        "razorpayOrderId": existing.razorpay_order_id,
+                        "mode": "mock" if gateway.is_mock else "payment_link",
+                    },
+                    "mock": gateway.is_mock,
+                    "idempotent": True,
+                }
+        return JSONResponse(status_code=409, content={"message": "Duplicate order request."})
 
     gateway = get_gateway()
     payment: dict = {"razorpayOrderId": order.razorpay_order_id}
@@ -317,6 +357,18 @@ def agent_pay_mock(
         booking = confirm_payment(
             session, order, payment_id, signature, actor="ai_buyer", actor_ref=key.id
         )
+    except OrderAlreadyProcessed as e:
+        resolved = e.order
+        if resolved.status == OrderStatus.paid and resolved.booking_id:
+            return {
+                "orderId": resolved.id,
+                "status": "paid",
+                "bookingId": resolved.booking_id,
+                "razorpayPaymentId": resolved.razorpay_payment_id,
+            }
+        return JSONResponse(
+            status_code=409, content={"message": f"Order is already {resolved.status.value}"}
+        )
     except PaymentVerificationError as e:
         return JSONResponse(status_code=400, content={"message": str(e)})
     return {
@@ -346,6 +398,11 @@ def agent_cancel_order(
         )
     except CartError as e:
         return JSONResponse(status_code=400, content={"message": str(e)})
+    except PaymentGatewayError:
+        return JSONResponse(
+            status_code=502,
+            content={"message": "The payment gateway is temporarily unavailable — please try again."},
+        )
     return {
         "orderId": order.id,
         "status": order.status.value,

@@ -14,7 +14,9 @@ i.e. an explicit human click — that is the gate.
 
 import json
 import re
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -22,12 +24,10 @@ from sqlmodel import Session, select
 
 from app.commerce.audit import log_action
 from app.commerce.guardrails import check_order_bounds
-from app.commerce.orders import CartError, price_cart
+from app.commerce.orders import CartError, PricedCart, price_cart
+from app.config import get_settings
 from app.db.models import Lawyer, ServiceAddon
 from app.tools.lawyer_recommender import recommend_lawyers
-
-SESSION_TTL_SECONDS = 7200
-_MAX_SESSIONS = 500
 
 
 @dataclass
@@ -39,28 +39,47 @@ class ConciergeSession:
     updated_at: float = field(default_factory=time.time)
 
 
-_sessions: Dict[str, ConciergeSession] = {}
+# An OrderedDict guarded by a plain threading.Lock, not an asyncio.Lock:
+# this dict is mutated both from the async handle_turn (event-loop thread)
+# and from the sync clear_session endpoint (a FastAPI threadpool thread),
+# and an asyncio.Lock only serializes coroutines on one loop, not real
+# threads. move_to_end on every touch + popitem(last=False) on eviction
+# gives LRU semantics instead of the previous FIFO-by-insertion-order
+# eviction, which could drop an actively-used session while an idle one
+# survived.
+_sessions: "OrderedDict[str, ConciergeSession]" = OrderedDict()
+_sessions_lock = threading.Lock()
 
 
 def _get_session_state(session_id: str, user_id: str) -> ConciergeSession:
+    settings = get_settings()
     now = time.time()
-    for sid in [s for s, st in _sessions.items() if now - st.updated_at > SESSION_TTL_SECONDS]:
-        _sessions.pop(sid, None)
-    while len(_sessions) >= _MAX_SESSIONS:
-        _sessions.pop(next(iter(_sessions)), None)
-    state = _sessions.get(session_id)
-    if state is None or state.user_id != user_id:
-        state = ConciergeSession(user_id=user_id)
-        _sessions[session_id] = state
-    state.updated_at = now
-    return state
+    with _sessions_lock:
+        expired = [
+            sid
+            for sid, st in _sessions.items()
+            if now - st.updated_at > settings.session_ttl_seconds
+        ]
+        for sid in expired:
+            _sessions.pop(sid, None)
+        while len(_sessions) >= settings.max_sessions:
+            _sessions.popitem(last=False)
+        state = _sessions.get(session_id)
+        if state is None or state.user_id != user_id:
+            state = ConciergeSession(user_id=user_id)
+            _sessions[session_id] = state
+        else:
+            _sessions.move_to_end(session_id)
+        state.updated_at = now
+        return state
 
 
 def forget_session(session_id: str) -> None:
     """Drop a session's in-memory selection state (lawyer/addons/last
     results). Used when a conversation's durable history row is deleted, so
     a since-deleted session_id doesn't keep silently reusing stale state."""
-    _sessions.pop(session_id, None)
+    with _sessions_lock:
+        _sessions.pop(session_id, None)
 
 
 # ── Intent parsing ──────────────────────────────────────────────────────────
@@ -151,7 +170,8 @@ async def _parse_intent(message: str) -> Dict[str, Any]:
         from app.chatbot import get_fast_llm, invoke_llm_safely, strip_reasoning_tags
 
         raw = await invoke_llm_safely(
-            get_fast_llm(), _PARSE_PROMPT.format(message=message[:500]), stream=False
+            get_fast_llm(), _PARSE_PROMPT.format(message=message[:500]), stream=False,
+            timeout_seconds=20.0,
         )
         raw = strip_reasoning_tags(raw)
         match = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -189,12 +209,20 @@ def _resolve_lawyer(db: Session, state: ConciergeSession, ref: str) -> Optional[
     for word, idx in _ORDINALS.items():
         if word in ref_l and idx < len(state.last_results):
             return db.get(Lawyer, state.last_results[idx])
+    # Try the lawyers we actually just showed before scanning the whole
+    # table -- "go with Priya" / "the criminal lawyer" almost always names
+    # one of last_results, not some other lawyer never mentioned yet.
+    shown = [lw for lid in state.last_results if (lw := db.get(Lawyer, lid)) is not None]
+    for lawyer in shown:
+        parts = lawyer.name.lower().split()
+        if lawyer.name.lower() in ref_l or any(p in ref_l for p in parts if len(p) > 3):
+            return lawyer
+    if len(shown) == 1:
+        return shown[0]
     for lawyer in db.exec(select(Lawyer)).all():
         parts = lawyer.name.lower().split()
         if lawyer.name.lower() in ref_l or any(p in ref_l for p in parts if len(p) > 3):
             return lawyer
-    if len(state.last_results) == 1:
-        return db.get(Lawyer, state.last_results[0])
     return None
 
 
@@ -213,6 +241,15 @@ def _relevant_addons(db: Session, lawyer: Lawyer, exclude: List[str]) -> List[Se
     ]
 
 
+def _to_cart_payload(cart: PricedCart) -> Dict[str, Any]:
+    return {
+        "lawyer": cart.lawyer.to_dict(),
+        "addons": [a.to_dict() for a in cart.addons],
+        "lineItems": cart.line_items(),
+        "totalInr": cart.total_inr,
+    }
+
+
 def _cart_payload(db: Session, state: ConciergeSession) -> Optional[Dict[str, Any]]:
     if not state.lawyer_id:
         return None
@@ -220,12 +257,7 @@ def _cart_payload(db: Session, state: ConciergeSession) -> Optional[Dict[str, An
         cart = price_cart(db, state.lawyer_id, state.addon_ids)
     except CartError:
         return None
-    return {
-        "lawyer": cart.lawyer.to_dict(),
-        "addons": [a.to_dict() for a in cart.addons],
-        "lineItems": cart.line_items(),
-        "totalInr": cart.total_inr,
-    }
+    return _to_cart_payload(cart)
 
 
 # ── Main turn handler ───────────────────────────────────────────────────────
@@ -242,6 +274,9 @@ async def handle_turn(
     lawyers_out: List[dict] = []
     proposal = None
     suggestions: List[str] = []
+    # Set by any branch that already priced the cart for its own reply, so
+    # the final return doesn't re-price it a second time from scratch.
+    cart_payload: Optional[Dict[str, Any]] = None
 
     if intent == "find_lawyer":
         try:
@@ -252,21 +287,22 @@ async def handle_turn(
                 max_hourly_rate=slots.get("budget_inr"),
                 limit=3,
             )
+            if not results:
+                # Semantic search can come up empty (e.g. embeddings not
+                # backfilled); retry on structured filters alone before
+                # falling back to an unfiltered answer. Kept inside the
+                # same try block as the first call so a semantic-search
+                # outage (Lite mode / missing embedding model) can't crash
+                # this retry too -- both attempts share one fallback path.
+                results = await recommend_lawyers(
+                    db,
+                    specialty=slots.get("specialty"),
+                    max_hourly_rate=slots.get("budget_inr"),
+                    limit=3,
+                )
         except Exception as e:
-            # Lite mode / missing embedding model: semantic search is
-            # unavailable, structured filters below still work.
             print(f"[Concierge] semantic search unavailable: {e}")
             results = []
-        if not results:
-            # Semantic search can come up empty (e.g. embeddings not
-            # backfilled); retry on structured filters alone before giving
-            # an unfiltered answer.
-            results = await recommend_lawyers(
-                db,
-                specialty=slots.get("specialty"),
-                max_hourly_rate=slots.get("budget_inr"),
-                limit=3,
-            )
         if not results:
             results = list(db.exec(select(Lawyer).order_by(Lawyer.rating.desc()).limit(3)).all())
         state.last_results = [lw.id for lw in results]
@@ -322,8 +358,8 @@ async def handle_turn(
                     if a.id not in state.addon_ids:
                         state.addon_ids.append(a.id)
                 added = " and ".join(a.name for a in addons)
-                cart = _cart_payload(db, state)
-                reply = f"Added {added}. Your total is now ₹{cart['totalInr']}. Say 'checkout' when ready."
+                cart_payload = _cart_payload(db, state)
+                reply = f"Added {added}. Your total is now ₹{cart_payload['totalInr']}. Say 'checkout' when ready."
                 suggestions = ["Checkout", "Show my cart"]
 
     elif intent == "remove_addon":
@@ -331,24 +367,33 @@ async def handle_turn(
         for a in addons:
             if a.id in state.addon_ids:
                 state.addon_ids.remove(a.id)
-        cart = _cart_payload(db, state)
-        total_txt = f" Total is now ₹{cart['totalInr']}." if cart else ""
+        cart_payload = _cart_payload(db, state)
+        total_txt = f" Total is now ₹{cart_payload['totalInr']}." if cart_payload else ""
         reply = f"Done, removed.{total_txt}"
 
     elif intent == "show_cart":
-        cart = _cart_payload(db, state)
-        if not cart:
+        cart_payload = _cart_payload(db, state)
+        if not cart_payload:
             reply = "Your cart is empty. Tell me what legal help you need and I'll find the right lawyer."
         else:
-            lines = "; ".join(f"{li['label']}: ₹{li['amountInr']}" for li in cart["lineItems"])
-            reply = f"Your cart: {lines}. Total ₹{cart['totalInr']}. Say 'checkout' to proceed."
+            lines = "; ".join(f"{li['label']}: ₹{li['amountInr']}" for li in cart_payload["lineItems"])
+            reply = f"Your cart: {lines}. Total ₹{cart_payload['totalInr']}. Say 'checkout' to proceed."
             suggestions = ["Checkout"]
 
     elif intent == "checkout":
+        cart_obj = None
         if not state.lawyer_id:
             reply = "There's nothing to check out yet — tell me what you need and I'll find a lawyer."
         else:
-            cart_obj = price_cart(db, state.lawyer_id, state.addon_ids)
+            try:
+                cart_obj = price_cart(db, state.lawyer_id, state.addon_ids)
+            except CartError as e:
+                reply = (
+                    f"Your cart can't be checked out as-is ({e}) — an item may have "
+                    "become unavailable. Try removing it, or pick a different lawyer."
+                )
+        if cart_obj is not None:
+            cart_payload = _to_cart_payload(cart_obj)
             bounds = check_order_bounds(db, cart_obj.total_inr, "concierge", user_id=user_id)
             if not bounds.ok:
                 log_action(
@@ -398,7 +443,7 @@ async def handle_turn(
     return {
         "reply": reply,
         "lawyers": lawyers_out,
-        "cart": _cart_payload(db, state),
+        "cart": cart_payload if cart_payload is not None else _cart_payload(db, state),
         "proposal": proposal,
         "suggestions": suggestions,
     }
@@ -415,7 +460,9 @@ async def _answer_question(message: str) -> str:
     try:
         from app.chatbot import get_fast_llm, invoke_llm_safely, strip_reasoning_tags
 
-        answer = strip_reasoning_tags(await invoke_llm_safely(get_fast_llm(), prompt, stream=False))
+        answer = strip_reasoning_tags(
+            await invoke_llm_safely(get_fast_llm(), prompt, stream=False, timeout_seconds=20.0)
+        )
         if answer.strip():
             return answer.strip()
     except Exception as e:
@@ -428,7 +475,8 @@ async def _answer_question(message: str) -> str:
 
 
 def clear_cart(session_id: str) -> None:
-    state = _sessions.get(session_id)
-    if state:
-        state.lawyer_id = None
-        state.addon_ids = []
+    with _sessions_lock:
+        state = _sessions.get(session_id)
+        if state:
+            state.lawyer_id = None
+            state.addon_ids = []

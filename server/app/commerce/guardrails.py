@@ -55,17 +55,15 @@ def check_order_bounds(
         )
 
     since = datetime.now(timezone.utc) - timedelta(days=1)
-    since_open = datetime.now(timezone.utc) - timedelta(hours=1)
     # Paid orders in the last 24h, plus still-open ("created") orders from
-    # the last hour — otherwise an agent could mint unlimited unpaid
-    # Razorpay orders without ever tripping the cap.
+    # the same 24h window — otherwise an agent could mint an unpaid
+    # Razorpay order, let it sit past a short "still open" window, and have
+    # it silently stop counting against the cap while still being payable.
     stmt = (
         select(safunc.coalesce(safunc.sum(Order.total_amount_inr), 0))
         .where(Order.channel.in_(AGENT_CHANNELS))
-        .where(
-            ((Order.status == OrderStatus.paid) & (Order.created_at >= since))
-            | ((Order.status == OrderStatus.created) & (Order.created_at >= since_open))
-        )
+        .where(Order.created_at >= since)
+        .where(Order.status.in_([OrderStatus.paid, OrderStatus.created]))
     )
     if agent_key_id:
         stmt = stmt.where(Order.agent_key_id == agent_key_id)
