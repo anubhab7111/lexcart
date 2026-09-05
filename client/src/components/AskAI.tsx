@@ -59,8 +59,6 @@ interface AskAIProps {
   user: UserProfile | null;
   initialQuestion: string | null;
   onConsumeInitial: () => void;
-  onBookLawyer: () => void;
-  onViewLawyer: () => void;
   onNavigate: (v: View) => void;
 }
 

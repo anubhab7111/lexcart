@@ -171,8 +171,6 @@ export default function App() {
           user={user}
           initialQuestion={pendingQuestion}
           onConsumeInitial={() => setPendingQuestion(null)}
-          onBookLawyer={handleBook}
-          onViewLawyer={handleSelectLawyer}
           onNavigate={navigate}
         />
       )}
