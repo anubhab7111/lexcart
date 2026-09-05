@@ -18,10 +18,10 @@ interface Props {
 }
 
 const GATE_COLORS: Record<string, string> = {
-  pending: "#c98a1e",
-  approved: "#3e9a5f",
-  rejected: "#c0392b",
-  not_required: "#a3a29c",
+  pending: "var(--amber)",
+  approved: "var(--green)",
+  rejected: "var(--danger)",
+  not_required: "var(--muted-3)",
 };
 
 type Tab = "audit" | "campaigns" | "agents";
@@ -104,7 +104,7 @@ export function MerchantDashboard({ user }: Props) {
           ))}
         </div>
 
-        {error && <div style={{ background: "#fbecea", color: "var(--danger)", borderRadius: 10, padding: "10px 14px", font: "500 13px var(--font-body)", marginBottom: 14 }}>{error}</div>}
+        {error && <div className="error-banner" style={{ marginBottom: 14 }}>{error}</div>}
 
         {tab === "audit" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -119,7 +119,7 @@ export function MerchantDashboard({ user }: Props) {
                     gate: {a.gateStatus}
                   </span>
                   {a.boundsCheck !== "n/a" && (
-                    <span style={{ font: "600 11px var(--font-body)", color: a.boundsCheck === "passed" ? "#3e9a5f" : "#c0392b" }}>
+                    <span style={{ font: "600 11px var(--font-body)", color: a.boundsCheck === "passed" ? "var(--green)" : "var(--danger)" }}>
                       bounds: {a.boundsCheck}
                     </span>
                   )}
@@ -223,10 +223,10 @@ const CHANNEL_LABELS: Record<string, string> = {
 };
 
 const CHANNEL_COLORS: Record<string, string> = {
-  web: "#a3a29c",
-  concierge: "#3e9a5f",
+  web: "var(--muted-3)",
+  concierge: "var(--green)",
   agent_api: "#2f6fed",
-  campaign: "#c98a1e",
+  campaign: "var(--amber)",
 };
 
 function Metric({ label, value, sub }: { label: string; value: string; sub?: string }) {
@@ -261,13 +261,13 @@ function GrowthPanel({ stats }: { stats: MerchantStats }) {
       <div style={{ display: "flex", height: 10, borderRadius: 6, overflow: "hidden", marginBottom: 8 }}>
         {channels.map(([ch, amt]) => (
           <div key={ch} title={`${CHANNEL_LABELS[ch] || ch}: ${formatMoney(amt)}`}
-            style={{ width: `${(100 * amt) / stats.totalRevenueInr}%`, background: CHANNEL_COLORS[ch] || "#888" }} />
+            style={{ width: `${(100 * amt) / stats.totalRevenueInr}%`, background: CHANNEL_COLORS[ch] || "var(--muted-3)" }} />
         ))}
       </div>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 14 }}>
         {channels.map(([ch, amt]) => (
           <div key={ch} style={{ display: "flex", alignItems: "center", gap: 6, font: "500 12px var(--font-body)", color: "var(--muted)" }}>
-            <span style={{ width: 8, height: 8, borderRadius: 4, background: CHANNEL_COLORS[ch] || "#888", display: "inline-block" }} />
+            <span style={{ width: 8, height: 8, borderRadius: 4, background: CHANNEL_COLORS[ch] || "var(--muted-3)", display: "inline-block" }} />
             {CHANNEL_LABELS[ch] || ch} — {formatMoney(amt)} ({Math.round((100 * amt) / stats.totalRevenueInr)}%)
           </div>
         ))}

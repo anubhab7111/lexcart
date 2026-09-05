@@ -8,6 +8,7 @@ import {
 } from "../api";
 import { payOrder } from "../lib/razorpay";
 import { initials, avatarTint, formatMoney, type Lawyer, type UserProfile } from "../lib/ui";
+import { IconLock } from "./icons";
 
 interface Addon {
   id: string;
@@ -124,13 +125,13 @@ export function Payment({ lawyer, user, onBack, onSuccess }: Props) {
 
           {rows.map((r) => (
             <div key={r.label} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", font: "400 13.5px var(--font-body)", color: "var(--muted)" }}>
-              <span>{r.label}</span><span>{r.value}</span>
+              <span>{r.label}</span><span className="mono-num">{r.value}</span>
             </div>
           ))}
           <div className="divider" style={{ margin: "10px 0" }} />
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <span style={{ font: "600 14px var(--font-body)" }}>Total</span>
-            <span style={{ font: "700 22px var(--font-head)", color: "var(--accent)" }}>{formatMoney(total)}</span>
+            <span className="mono-num" style={{ font: "700 22px var(--font-head)", color: "var(--accent)" }}>{formatMoney(total)}</span>
           </div>
         </div>
 
@@ -143,11 +144,11 @@ export function Payment({ lawyer, user, onBack, onSuccess }: Props) {
               : "Payments are processed by Razorpay in test mode. Use a Razorpay test card to complete the booking."}
           </div>
 
-          {error && <div style={{ background: "#fbecea", color: "var(--danger)", borderRadius: 10, padding: "10px 14px", font: "500 13px var(--font-body)", marginBottom: 14 }}>{error}</div>}
+          {error && <div className="error-banner" style={{ marginBottom: 14 }}>{error}</div>}
 
           {mock === null && !error ? (
             <div style={{ padding: "36px 0", display: "flex", flexDirection: "column", alignItems: "center", gap: 14 }}>
-              <div className="spinner" style={{ width: 28, height: 28, borderColor: "rgba(44,110,107,.25)", borderTopColor: "var(--accent)" }} />
+              <div className="spinner" style={{ width: 28, height: 28, borderColor: "var(--border-2)", borderTopColor: "var(--accent)" }} />
               <div style={{ font: "500 13px var(--font-body)", color: "var(--muted-2)" }}>Establishing a secure connection…</div>
             </div>
           ) : (
@@ -160,7 +161,7 @@ export function Payment({ lawyer, user, onBack, onSuccess }: Props) {
                   Simulate a failed payment (demo)
                 </button>
               )}
-              <div style={{ textAlign: "center", marginTop: 12, font: "500 11px var(--font-body)", letterSpacing: ".08em", textTransform: "uppercase", color: "var(--muted-3)" }}>🔒 Razorpay {mock ? "mock" : "test"} mode · server-verified signatures</div>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, marginTop: 12, font: "500 11px var(--font-body)", letterSpacing: ".08em", textTransform: "uppercase", color: "var(--muted-3)" }}><IconLock size={13} /> Razorpay {mock ? "mock" : "test"} mode · server-verified signatures</div>
             </>
           )}
         </div>

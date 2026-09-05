@@ -18,6 +18,7 @@ import { Vault } from "./components/Vault";
 import { LegalCalendar } from "./components/LegalCalendar";
 import { Concierge } from "./components/Concierge";
 import { MerchantDashboard } from "./components/MerchantDashboard";
+import { IconCheck } from "./components/icons";
 import { fetchUserProfile } from "./api";
 import type { Lawyer, UserProfile } from "./lib/ui";
 
@@ -225,7 +226,7 @@ export default function App() {
       </ErrorBoundary>
 
       {toast && (
-        <div className="toast-wrap"><div className="toast">✓ {toast}</div></div>
+        <div className="toast-wrap"><div className="toast" style={{ display: "flex", alignItems: "center", gap: 8 }}><IconCheck size={14} /> {toast}</div></div>
       )}
     </div>
   );
