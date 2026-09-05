@@ -148,6 +148,10 @@ class IntentClassification:
     reasoning: str
     secondary_intents: List[str] = field(default_factory=list)
     scores: Dict[str, float] = field(default_factory=dict)  # all intents, for logs/debug
+    # The query's own embedding, exposed so a caller that also needs
+    # classify_domain_hint_embedding for the same text can pass it back in
+    # and skip a second, identical BGE-M3 forward pass.
+    query_vec: List[float] = field(default_factory=list)
 
 
 # ============================================================================
@@ -177,7 +181,7 @@ class _ReferenceSet:
                     start = len(all_texts)
                     all_texts.extend(examples)
                     spans[label] = (start, len(all_texts))
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 vectors = await loop.run_in_executor(
                     None, lambda: embeddings.embed_documents(all_texts)
                 )
@@ -214,7 +218,7 @@ async def classify_intent_embedding(
 ) -> IntentClassification:
     embeddings = await _get_shared_embeddings()
     reference = await _INTENT_REFERENCE_SET.get()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     query_vec = await loop.run_in_executor(None, lambda: embeddings.embed_query(text))
 
     scores: Dict[str, float] = {
@@ -248,6 +252,7 @@ async def classify_intent_embedding(
         ),
         secondary_intents=secondary,
         scores=scores,
+        query_vec=query_vec,
     )
 
 
@@ -298,11 +303,17 @@ _DOMAIN_HINT_REFERENCE_SET = _ReferenceSet(
 )
 
 
-async def classify_domain_hint_embedding(text: str) -> Optional[str]:
-    embeddings = await _get_shared_embeddings()
+async def classify_domain_hint_embedding(
+    text: str, query_vec: Optional[List[float]] = None
+) -> Optional[str]:
+    """query_vec: pass the vector already computed by classify_intent_embedding
+    for the same text (its .query_vec) to skip a second, identical BGE-M3
+    embed of the same string -- routing otherwise embeds every query twice."""
     reference = await _DOMAIN_HINT_REFERENCE_SET.get()
-    loop = asyncio.get_event_loop()
-    query_vec = await loop.run_in_executor(None, lambda: embeddings.embed_query(text))
+    if query_vec is None:
+        embeddings = await _get_shared_embeddings()
+        loop = asyncio.get_running_loop()
+        query_vec = await loop.run_in_executor(None, lambda: embeddings.embed_query(text))
 
     criminal_score = _aggregate(query_vec, reference["criminal"])
     other_score = _aggregate(query_vec, reference["other_domain"])
@@ -348,7 +359,7 @@ async def classify_document_subintent_embedding(text: str) -> str:
     query is asking for one or the other)."""
     embeddings = await _get_shared_embeddings()
     reference = await _DOCUMENT_SUBINTENT_REFERENCE_SET.get()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     query_vec = await loop.run_in_executor(None, lambda: embeddings.embed_query(text))
 
     validation_score = _aggregate(query_vec, reference["validation"])

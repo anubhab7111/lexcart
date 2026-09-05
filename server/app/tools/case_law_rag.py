@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import pickle
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -531,10 +532,16 @@ class CaseLawRAGSystem:
 
 
 _case_law_rag: Optional[CaseLawRAGSystem] = None
+_case_law_rag_lock = threading.Lock()
 
 
 def get_case_law_rag_system() -> CaseLawRAGSystem:
+    """Locked (see get_unified_rag_system's docstring for why a plain
+    check-then-construct here is a real race under concurrency)."""
     global _case_law_rag
-    if _case_law_rag is None:
-        _case_law_rag = CaseLawRAGSystem()
-    return _case_law_rag
+    if _case_law_rag is not None:
+        return _case_law_rag
+    with _case_law_rag_lock:
+        if _case_law_rag is None:
+            _case_law_rag = CaseLawRAGSystem()
+        return _case_law_rag

@@ -6,7 +6,11 @@ Provides access to Indian legal codes, case law, and statutes through the Indian
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 import asyncio
+import threading
 import aiohttp
+from cachetools import TTLCache
+
+from app.config import get_settings
 
 
 @dataclass
@@ -66,7 +70,12 @@ class IndianKanoonClient:
         """
         self.api_key = api_key
         self.session: Optional[aiohttp.ClientSession] = None
-        self._cache = {}  # Simple in-memory cache
+        # Bounded + TTL'd -- a plain dict here only ever grows (one entry
+        # per unique query), which is unbounded memory growth over a
+        # long-running single worker.
+        self._cache: "TTLCache[str, Any]" = TTLCache(
+            maxsize=512, ttl=get_settings().cache_ttl_seconds
+        )
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session with request timeout."""
@@ -381,11 +390,14 @@ class IndianKanoonTool:
 
 # Singleton pattern for the tool
 _indian_kanoon_tool: Optional[IndianKanoonTool] = None
+_indian_kanoon_tool_lock = threading.Lock()
 
 
 def get_indian_kanoon_tool(api_key: Optional[str] = None) -> IndianKanoonTool:
     """
-    Get or create the Indian Kanoon tool instance.
+    Get or create the Indian Kanoon tool instance. Locked (see
+    unified_legal_rag.get_unified_rag_system's docstring for why a plain
+    check-then-construct here is a real race under concurrency).
 
     Args:
         api_key: Optional API key (will use from config if not provided)
@@ -395,13 +407,13 @@ def get_indian_kanoon_tool(api_key: Optional[str] = None) -> IndianKanoonTool:
     """
     global _indian_kanoon_tool
 
-    if _indian_kanoon_tool is None:
-        if api_key is None:
-            from app.config import get_settings
+    if _indian_kanoon_tool is not None:
+        return _indian_kanoon_tool
 
-            settings = get_settings()
-            api_key = settings.indian_kanoon_api_key
-
-        _indian_kanoon_tool = IndianKanoonTool(api_key)
-
-    return _indian_kanoon_tool
+    with _indian_kanoon_tool_lock:
+        if _indian_kanoon_tool is None:
+            if api_key is None:
+                settings = get_settings()
+                api_key = settings.indian_kanoon_api_key
+            _indian_kanoon_tool = IndianKanoonTool(api_key)
+        return _indian_kanoon_tool

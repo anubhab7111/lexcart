@@ -5,6 +5,7 @@ Single Python backend: chatbot/RAG plus auth, lawyers, and bookings
 """
 
 import asyncio
+import logging
 import os
 import traceback
 from contextlib import asynccontextmanager
@@ -17,6 +18,16 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import get_settings
 from app.deps.errors import MessageHTTPException
+
+# Most of this codebase's own diagnostics use print() (see _warmup's
+# docstring below for why), but app/metrics/* and app/multilingual/* use
+# logging.getLogger(__name__) -- with no handler configured anywhere,
+# those calls were silently dropped rather than reaching stderr. This is
+# additive only: it does not change any of the print() call sites.
+logging.basicConfig(
+    level=logging.DEBUG if get_settings().debug else logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 
 # Lite mode (LEXCART_LITE=1): boot only the agentic-commerce surface —
 # auth, lawyers, payments, concierge, AI-buyer API, campaigns — with no
@@ -169,8 +180,37 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy", "version": "1.0.0"}
+    """Health check: distinguishes "process is up" from "process is up but
+    a real dependency is down" -- the previous static response couldn't
+    tell an operator anything. DB and (outside lite mode) Ollama are
+    probed with a short timeout each; a probe failure is reported, not
+    raised, so /health itself never 500s."""
+    settings = get_settings()
+    checks: dict = {}
+
+    try:
+        from sqlalchemy import text
+
+        from app.db.engine import get_engine
+
+        with get_engine().connect() as conn:
+            conn.execute(text("SELECT 1"))
+        checks["database"] = "ok"
+    except Exception as e:
+        checks["database"] = f"error: {e}" if settings.debug else "error"
+
+    if not LITE_MODE:
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                resp = await client.get(f"{settings.ollama_base_url}/api/version")
+            checks["ollama"] = "ok" if resp.status_code == 200 else f"error: status {resp.status_code}"
+        except Exception as e:
+            checks["ollama"] = f"error: {e}" if settings.debug else "error"
+
+    overall = "healthy" if all(v == "ok" for v in checks.values()) else "degraded"
+    return {"status": overall, "version": "1.0.0", "checks": checks}
 
 
 # ============================================================================

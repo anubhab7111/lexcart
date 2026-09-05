@@ -29,8 +29,39 @@ def _derive_mock_secret(purpose: str) -> str:
     return hashlib.sha256(f"lexcart-mock-{purpose}|{jwt_secret()}".encode()).hexdigest()
 
 
+# The SDK's underlying requests.Session has no default timeout, so a hung
+# Razorpay call would otherwise tie up a threadpool worker (every endpoint
+# that calls this gateway is a sync `def`) indefinitely.
+_REQUEST_TIMEOUT_SECONDS = 15
+
+
 class PaymentGatewayError(Exception):
-    pass
+    """Base for any Razorpay gateway failure."""
+
+
+class PaymentGatewayTransientError(PaymentGatewayError):
+    """A network-level or server-side failure (timeout, connection error,
+    Razorpay 5xx) -- the same request is likely to succeed on retry."""
+
+
+class PaymentGatewayRejectedError(PaymentGatewayError):
+    """Razorpay understood the request and rejected it (bad request) --
+    retrying with the same parameters will not help; the caller made an
+    invalid request (bad amount, malformed notes, etc.)."""
+
+
+def _wrap_gateway_error(action: str, e: Exception) -> PaymentGatewayError:
+    """Classify a real-SDK exception into a retryable vs. fatal
+    PaymentGatewayError so callers (and their audit rows) can tell the two
+    apart, instead of every failure looking identical."""
+    import requests
+    from razorpay.errors import BadRequestError, GatewayError, ServerError
+
+    if isinstance(e, BadRequestError):
+        return PaymentGatewayRejectedError(f"Razorpay {action} rejected: {e}")
+    if isinstance(e, (ServerError, GatewayError, requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return PaymentGatewayTransientError(f"Razorpay {action} failed (transient): {e}")
+    return PaymentGatewayError(f"Razorpay {action} failed: {e}")
 
 
 class RazorpayGateway:
@@ -44,6 +75,10 @@ class RazorpayGateway:
 
             self._client = razorpay.Client(auth=(key_id, key_secret))
             self._client.set_app_details({"title": "LexCart", "version": "1.0"})
+            # The SDK's own retry (exponential backoff + jitter) only fires
+            # for requests.exceptions.ConnectionError/Timeout, never for a
+            # request Razorpay actually rejected -- safe to enable broadly.
+            self._client.enable_retry(True)
 
     @property
     def public_key_id(self) -> str:
@@ -87,12 +122,19 @@ class RazorpayGateway:
                     "currency": "INR",
                     "receipt": receipt,
                     "notes": notes or {},
-                }
+                },
+                # Best-effort defense-in-depth: if Razorpay honors this
+                # header, a retried create with the same receipt dedupes on
+                # their side too. The guarantee we actually depend on is
+                # our own DB-level uniqueness (see orders table migrations),
+                # not this header — treat it as a bonus, not the contract.
+                headers={"X-Razorpay-Idempotency-Key": receipt},
+                timeout=_REQUEST_TIMEOUT_SECONDS,
             )
             order["mock"] = False
             return order
         except Exception as e:
-            raise PaymentGatewayError(f"Razorpay order creation failed: {e}") from e
+            raise _wrap_gateway_error("order creation", e) from e
 
     def verify_payment_signature(
         self, order_id: str, payment_id: str, signature: str
@@ -155,12 +197,14 @@ class RazorpayGateway:
             }
         try:
             refund = self._client.payment.refund(
-                payment_id, {"amount": amount_paise, "notes": notes or {}}
+                payment_id,
+                {"amount": amount_paise, "notes": notes or {}},
+                timeout=_REQUEST_TIMEOUT_SECONDS,
             )
             refund["mock"] = False
             return refund
         except Exception as e:
-            raise PaymentGatewayError(f"Razorpay refund failed: {e}") from e
+            raise _wrap_gateway_error("refund", e) from e
 
     def create_payment_link(
         self,
@@ -191,12 +235,14 @@ class RazorpayGateway:
                     "description": description,
                     "reference_id": reference_id,
                     "notes": notes or {},
-                }
+                },
+                headers={"X-Razorpay-Idempotency-Key": reference_id},
+                timeout=_REQUEST_TIMEOUT_SECONDS,
             )
             link["mock"] = False
             return link
         except Exception as e:
-            raise PaymentGatewayError(f"Razorpay payment link failed: {e}") from e
+            raise _wrap_gateway_error("payment link creation", e) from e
 
 
 @lru_cache()

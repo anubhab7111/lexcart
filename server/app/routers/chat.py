@@ -291,7 +291,9 @@ async def chat(
             lawyers_found=result.get("lawyers_found"),
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Chat processing error: {str(e)}")
+        print(f"Chat processing error: {e}")
+        detail = f"Chat processing error: {e}" if get_settings().debug else "Chat processing error."
+        raise HTTPException(status_code=500, detail=detail)
 
 
 @router.post("/stream")
@@ -343,7 +345,13 @@ async def chat_stream(
                         )
                 yield f"data: {json.dumps(event)}\n\n"
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+            print(f"Chat stream error: {e}")
+            # This 200-status SSE frame is the streaming path's only error
+            # surface, so it must honor the same debug gating as the
+            # non-streaming 500 handler (app.main.global_exception_handler)
+            # instead of always leaking str(e) to the client.
+            content = str(e) if get_settings().debug else "An unexpected error occurred."
+            yield f"data: {json.dumps({'type': 'error', 'content': content})}\n\n"
 
     return StreamingResponse(
         event_generator(),

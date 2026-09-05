@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
@@ -27,7 +28,7 @@ from app.db.models import (
     User,
 )
 from app.deps.auth import get_current_user
-from app.services.razorpay_gateway import get_gateway
+from app.services.razorpay_gateway import PaymentGatewayError, get_gateway
 
 router = APIRouter(prefix="/api/concierge", tags=["concierge"])
 
@@ -106,9 +107,25 @@ async def chat(
     if not body.message.strip():
         return JSONResponse(status_code=400, content={"message": "Empty message"})
     session_id = _resolve_session_id(session, current_user, body.sessionId)
-    result = await concierge.handle_turn(
-        session, session_id, current_user.id, body.message.strip()
-    )
+    try:
+        result = await concierge.handle_turn(
+            session, session_id, current_user.id, body.message.strip()
+        )
+    except Exception as e:
+        # A turn should degrade to a message, never a 500 -- the user typed
+        # something conversational, not a request they can "fix" by seeing
+        # a stack trace. Roll back any partial work the failed turn left on
+        # the session before persisting a clean reply.
+        print(f"[Concierge] handle_turn failed unexpectedly: {e}")
+        session.rollback()
+        result = {
+            "reply": "Sorry, something went wrong on my end handling that — "
+            "could you try rephrasing, or say 'show my cart' to see where things stand?",
+            "lawyers": [],
+            "cart": None,
+            "proposal": None,
+            "suggestions": ["Show my cart", "Find me a lawyer"],
+        }
     _persist_concierge_turn(
         session, current_user, session_id,
         body.message.strip(), result["reply"], result.get("lawyers") or [],
@@ -150,18 +167,47 @@ def confirm(
             status_code=400, content={"message": "Proposal not found or already resolved."}
         )
 
+    # Atomically claim the proposal before doing anything else. Two rapid
+    # Confirm & Pay clicks (or a client retry) both pass the plain-read
+    # check above; only this conditional UPDATE is the real gate — the
+    # request whose UPDATE actually flips a "pending" row wins, the loser
+    # sees rowcount 0 and is told the proposal is already resolved, so at
+    # most one order is ever created from one proposal.
+    claim = session.execute(
+        sa_update(AgentAction)
+        .where(AgentAction.id == proposal.id, AgentAction.gate_status == "pending")
+        .values(gate_status="approved")
+    )
+    session.commit()
+    if claim.rowcount == 0:
+        return JSONResponse(
+            status_code=400, content={"message": "Proposal not found or already resolved."}
+        )
+    session.refresh(proposal)
+
+    def _release_claim() -> None:
+        """Roll the claim back to pending on any downstream failure so the
+        user isn't permanently locked out of a proposal that never actually
+        produced an order."""
+        proposal.gate_status = "pending"
+        session.add(proposal)
+        session.commit()
+
     snapshot = proposal.detail or {}
     lawyer_id = snapshot.get("lawyerId")
     addon_ids = snapshot.get("addonIds", [])
     if not lawyer_id:
+        _release_claim()
         return JSONResponse(status_code=400, content={"message": "Proposal snapshot missing — ask the concierge again."})
 
     try:
         cart = price_cart(session, lawyer_id, addon_ids)
     except CartError as e:
+        _release_claim()
         return JSONResponse(status_code=400, content={"message": str(e)})
 
     if cart.total_inr != snapshot.get("totalInr"):
+        _release_claim()
         return JSONResponse(
             status_code=409,
             content={
@@ -182,11 +228,14 @@ def confirm(
             gate_status="approved",
         )
     except BoundsExceeded as e:
+        _release_claim()
         return JSONResponse(status_code=400, content={"message": e.result.reason})
-
-    proposal.gate_status = "approved"
-    session.add(proposal)
-    session.commit()
+    except PaymentGatewayError:
+        _release_claim()
+        return JSONResponse(
+            status_code=502,
+            content={"message": "The payment gateway is temporarily unavailable — please try again."},
+        )
 
     gateway = get_gateway()
     return {

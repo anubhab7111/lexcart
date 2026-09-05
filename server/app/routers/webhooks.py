@@ -24,6 +24,7 @@ from sqlmodel import Session, select
 from app.commerce.audit import log_action
 from app.commerce.orders import (
     CartError,
+    OrderAlreadyProcessed,
     PaymentVerificationError,
     confirm_campaign_link_payment,
     confirm_payment,
@@ -101,6 +102,13 @@ async def razorpay_webhook(request: Request, session: Session = Depends(get_sess
                 session, order, payment_id, "", actor="gateway", actor_ref="webhook",
                 pre_verified=True,
             )
+        except OrderAlreadyProcessed as e:
+            # A client-side /verify (or agent pay-mock) call beat the
+            # webhook to this order under the row lock -- that's the normal
+            # case this "already_processed" check above was trying to
+            # short-circuit anyway, just caught atomically instead of via
+            # a racy pre-read.
+            return {"status": "already_processed", "orderStatus": e.order.status.value}
         except PaymentVerificationError as e:
             return {"status": "error", "message": str(e)}
         return {"status": "processed"}

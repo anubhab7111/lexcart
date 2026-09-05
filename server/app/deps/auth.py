@@ -58,14 +58,28 @@ def get_current_user_optional(
 
 
 def require_merchant(user: User = Depends(get_current_user)) -> User:
-    """Gate for merchant-only routes (campaign approval, full audit trail).
+    """Gate for merchant-only routes (campaign approval, full audit trail —
+    minting live discounts/links and reading the cross-user agent audit
+    trail).
 
-    MERCHANT_EMAILS is an allowlist; left empty (the default) it's a no-op
-    so the buildathon demo — one operator, no separate merchant account —
-    and the evaluation harness work unmodified. Set it in .env to restrict
-    these routes to specific accounts.
+    MERCHANT_EMAILS is an allowlist. With it unset, this fails *closed*
+    (403 for everyone) except in local debug mode, where it's a no-op so a
+    single-operator buildathon demo or the evaluation harness can run
+    without provisioning a merchant account. An unset allowlist that
+    defaulted to "let any authenticated user in" would be a real
+    privilege-escalation gap the moment this runs anywhere but a laptop.
+    Set MERCHANT_EMAILS in .env to restrict these routes to specific
+    accounts in any non-debug deployment.
     """
-    allowlist = [e.strip().lower() for e in get_settings().merchant_emails.split(",") if e.strip()]
-    if allowlist and user.email.lower() not in allowlist:
+    settings = get_settings()
+    allowlist = [e.strip().lower() for e in settings.merchant_emails.split(",") if e.strip()]
+    if not allowlist:
+        if settings.debug:
+            return user
+        raise MessageHTTPException(
+            status_code=403,
+            detail="Merchant access required (no MERCHANT_EMAILS configured)",
+        )
+    if user.email.lower() not in allowlist:
         raise MessageHTTPException(status_code=403, detail="Merchant access required")
     return user

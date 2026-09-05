@@ -394,8 +394,15 @@ CREATE TABLE "orders" (
 
 CREATE UNIQUE INDEX "orders_razorpay_order_id_key" ON "orders"("razorpay_order_id");
 CREATE INDEX "orders_user_id_idx" ON "orders"("user_id");
-CREATE INDEX "orders_agent_key_id_buyer_reference_idx" ON "orders"("agent_key_id", "buyer_reference")
+-- Unique (not just indexed): agent_create_order's buyerReference dedup and
+-- confirm_campaign_link_payment's razorpay_payment_id dedup are both
+-- read-then-insert, which races under concurrent retries/duplicate webhook
+-- deliveries -- the uniqueness is what turns the loser's insert into a
+-- catchable IntegrityError instead of a silent duplicate order.
+CREATE UNIQUE INDEX "orders_agent_key_id_buyer_reference_key" ON "orders"("agent_key_id", "buyer_reference")
     WHERE "buyer_reference" IS NOT NULL;
+CREATE UNIQUE INDEX "orders_razorpay_payment_id_key" ON "orders"("razorpay_payment_id")
+    WHERE "razorpay_payment_id" IS NOT NULL;
 
 CREATE TABLE "agent_actions" (
     "id" TEXT NOT NULL,

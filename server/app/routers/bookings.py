@@ -22,6 +22,7 @@ from app.commerce.audit import log_action
 from app.commerce.orders import (
     BoundsExceeded,
     CartError,
+    OrderAlreadyProcessed,
     PaymentVerificationError,
     confirm_payment,
     create_order,
@@ -32,7 +33,7 @@ from app.db.engine import get_session
 from app.db.models import Booking, BookingStatus, Order, OrderStatus, User
 from app.deps.auth import get_current_user
 from app.deps.errors import MessageHTTPException
-from app.services.razorpay_gateway import get_gateway
+from app.services.razorpay_gateway import PaymentGatewayError, get_gateway
 
 router = APIRouter(prefix="/api/bookings", tags=["bookings"])
 
@@ -74,6 +75,11 @@ def create_checkout_order(
         )
     except BoundsExceeded as e:
         return JSONResponse(status_code=400, content={"message": e.result.reason})
+    except PaymentGatewayError:
+        return JSONResponse(
+            status_code=502,
+            content={"message": "The payment gateway is temporarily unavailable — please try again."},
+        )
 
     gateway = get_gateway()
     return {
@@ -124,6 +130,23 @@ def verify_checkout(
             body.razorpaySignature,
             actor="web_checkout",
             actor_ref=current_user.id,
+        )
+    except OrderAlreadyProcessed as e:
+        # The webhook (or a duplicate client retry) already resolved this
+        # order while we were waiting on confirm_payment's row lock. If it
+        # ended up paid, that's a success from this user's perspective --
+        # replay it instead of erroring on a race they didn't cause.
+        resolved = e.order
+        if resolved.status == OrderStatus.paid and resolved.booking_id:
+            existing_booking = session.get(Booking, resolved.booking_id)
+            if existing_booking is not None:
+                return {
+                    "status": "success",
+                    "transactionId": existing_booking.transaction_id,
+                    "bookingId": existing_booking.id,
+                }
+        return JSONResponse(
+            status_code=409, content={"message": f"This order is already {resolved.status.value}."}
         )
     except PaymentVerificationError as e:
         return JSONResponse(status_code=400, content={"status": "error", "message": str(e)})

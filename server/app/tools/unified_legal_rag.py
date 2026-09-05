@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -281,11 +282,26 @@ class UnifiedLegalRAGSystem(BaseLegalRAGSystem):
 # ─────────────────────────────────────────────────────────────
 
 _unified_rag: Optional[UnifiedLegalRAGSystem] = None
+_unified_rag_lock = threading.Lock()
 
 
 def get_unified_rag_system() -> UnifiedLegalRAGSystem:
-    """Get or create the UnifiedLegalRAGSystem singleton."""
+    """Get or create the UnifiedLegalRAGSystem singleton.
+
+    Locked (threading.Lock, not asyncio.Lock -- this is a sync function
+    reachable from both the event loop and any sync/threadpool caller):
+    an unlocked check-then-construct here is a real double-checked-locking
+    race under concurrency at cold start -- two callers can each construct
+    and return a *different* UnifiedLegalRAGSystem instance, and if both
+    then call .initialize() (each instance's own build lock only guards
+    that instance), two builds race on the same on-disk FAISS/meta.pkl/
+    sections.json files. Warmup normally wins this race by constructing
+    first, so this only matters in a genuine concurrent-cold-start window.
+    """
     global _unified_rag
-    if _unified_rag is None:
-        _unified_rag = UnifiedLegalRAGSystem()
-    return _unified_rag
+    if _unified_rag is not None:
+        return _unified_rag
+    with _unified_rag_lock:
+        if _unified_rag is None:
+            _unified_rag = UnifiedLegalRAGSystem()
+        return _unified_rag
