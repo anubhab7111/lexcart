@@ -91,7 +91,7 @@ export async function payOrder(
       description: "Legal consultation booking",
       order_id: order.razorpayOrderId,
       prefill: { name: opts.name || "", email: opts.email || "" },
-      theme: { color: "#2c6e6b" },
+      theme: { color: "#8c6f2f" },
       handler: async (resp: any) => {
         settled = true;
         try {
