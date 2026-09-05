@@ -1,0 +1,36 @@
+name: eval
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  self-evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and start the stack
+        run: docker compose up --build -d
+
+      - name: Wait for the server to report healthy
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8000/health >/dev/null 2>&1; then
+              echo "server is healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "server never became healthy" >&2
+          docker compose logs
+          exit 1
+
+      - name: Run the self-evaluation harness
+        run: docker compose exec -T server python /app/demo/evaluate.py
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs

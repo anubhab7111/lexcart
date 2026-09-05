@@ -1,0 +1,12 @@
+.env
+myenv
+node_modules
+__pycache__
+*/__pycache__
+**/__pycache__/
+dist
+results/
+app/metrics/.judge_cache.json
+app/metrics/.judge_usage.json
+
+app/data/vault/

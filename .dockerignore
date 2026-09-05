@@ -1,0 +1,17 @@
+.git
+.claude
+client/node_modules
+client/build
+server/app/data/bare_acts
+server/app/data/faiss_index
+server/app/data/case_law
+server/app/data/mappings
+server/app/data/notifications
+server/app/data/rules
+server/app/data/explanatory
+server/app/data/guides
+server/app/data/models
+server/app/data/vault
+server/__pycache__
+**/__pycache__
+server/.env

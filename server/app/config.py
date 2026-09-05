@@ -1,0 +1,203 @@
+"""
+Configuration module for the legal chatbot.
+"""
+
+from pydantic_settings import BaseSettings
+from functools import lru_cache
+
+
+class Settings(BaseSettings):
+    """Application settings loaded from environment variables."""
+
+    # Ollama configuration
+    ollama_base_url: str = "http://localhost:11434"
+    # llm_model: str = "mistral-indian-law:latest"
+    # qwen3:14b Q4 (~9GB) spills off a 4GB GPU onto CPU (~3 tok/s, ~500s/answer).
+    # qwen3:4b (~2.5GB) fits fully in VRAM and matches fast_llm_model, so Ollama
+    # never swaps models mid-request.
+    llm_model: str = "qwen3:4b"
+    # Small model for classification/routing/query-rewrite calls
+    fast_llm_model: str = "qwen3:4b"
+    llm_temperature: float = 0.1
+
+    # Cross-encoder used to rerank fused BM25+dense candidates. Ranking
+    # quality is what matters (scores are used relatively); the base model
+    # keeps ~1.2GB of RAM free for the Ollama LLM on 16GB machines. Swap in
+    # BAAI/bge-reranker-v2-m3 on larger hardware for a small quality bump.
+    reranker_model: str = "BAAI/bge-reranker-base"
+
+    # Where the reranker runs: "auto" | "cuda" | "cpu". Auto avoids small
+    # (<6GB) GPUs entirely — the VRAM is worth more to Ollama's LLM offload.
+    reranker_device: str = "auto"
+
+    # Where the embedding model runs: "auto" | "cuda" | "cpu".
+    # Set EMBEDDINGS_DEVICE=cuda for one-off index rebuilds.
+    embeddings_device: str = "auto"
+
+    # Shared dense embedding model. BGE-M3 is multilingual (100+ languages)
+    # and still 1024-dim, so the pgvector columns and FAISS pipeline are
+    # unchanged — but its indices are model-specific and must be rebuilt after
+    # any change here. Unlike bge-large-en, M3 uses NO query-instruction
+    # prefix; leaving embedding_query_instruction blank is required or
+    # cross-lingual retrieval quality silently degrades.
+    embedding_model: str = "BAAI/bge-m3"
+    embedding_query_instruction: str = ""
+
+    # Chat session lifecycle
+    session_ttl_seconds: int = 7200
+    max_sessions: int = 500
+
+    # Server configuration
+    host: str = "0.0.0.0"
+    python_port: int = 8000
+    # Auto-restart on source change. Off by default: every model/embedding/
+    # reranker singleton and the RAG indices get reloaded from scratch on
+    # each restart, which is exactly what NOT to trigger mid-demo. Set
+    # RELOAD=true for local development.
+    reload: bool = False
+
+    # When True, unhandled errors return their message to the client (dev only).
+    # Default False so 500 responses never leak internal exception details.
+    debug: bool = False
+
+    # Allowed CORS origins (comma-separated). Kept explicit rather than "*"
+    # because allow_credentials=True + wildcard lets any origin make
+    # credentialed requests. Covers both the client's configured dev port
+    # (vite.config.ts: 3000) and Vite's own default (5173, e.g. docs/README
+    # examples) so a fresh clone isn't CORS-blocked before anyone touches
+    # .env — override for a LAN/deployed frontend origin.
+    cors_allow_origins: str = (
+        "http://localhost:3000,http://127.0.0.1:3000,"
+        "http://localhost:5173,http://127.0.0.1:5173"
+    )
+
+    # PostgreSQL connection string
+    database_url: str = ""
+
+    # Authentication
+    jwt_secret: str = ""
+
+    # Razorpay test-mode API keys (rzp_test_...). Leave blank to run the
+    # built-in mock gateway — same code paths, labeled mock ids.
+    razorpay_key_id: str = ""
+    razorpay_key_secret: str = ""
+    # Separate secret Razorpay signs webhook payloads with (dashboard ->
+    # test mode -> Webhooks). Leave blank to derive a mock secret from
+    # JWT_SECRET, same pattern as the mock gateway's payment signatures.
+    razorpay_webhook_secret: str = ""
+
+    # ── Agentic-commerce guardrails ─────────────────────────────────────
+    # Every money action the concierge/AI-buyer proposes is checked against
+    # these bounds BEFORE an order is created, and logged to agent_actions.
+    # Hard cap on a single agent-assisted order (INR).
+    agent_max_order_inr: int = 25000
+    # Rolling per-user daily cap across all agent-assisted orders (INR).
+    agent_daily_spend_cap_inr: int = 50000
+    # Campaign orchestrator bounds: max discount the agent may propose and
+    # max total budget a single campaign may commit.
+    campaign_max_discount_pct: int = 30
+    campaign_max_budget_inr: int = 100000
+    # Base URL advertised in the agent-readable catalog (/.well-known/...).
+    public_base_url: str = "http://localhost:8000"
+    # Comma-separated allowlist of emails that may act as the merchant
+    # (approve/reject campaigns, read the full audit trail). Empty (the
+    # default) means demo mode: any signed-in user is treated as the
+    # merchant, matching the buildathon demo where there's one operator.
+    merchant_emails: str = ""
+
+    # Optional external APIs
+    lawyer_api_key: str = ""
+    indian_kanoon_api_key: str = ""
+
+    # Case-data provider (My Cases / Hearing Reminders / Cause List Search).
+    # "mock" (default) uses an in-memory fixture provider for local dev —
+    # see app/tools/case_data_provider.py — until a licensed vendor
+    # (e.g. eCourtsIndia) is contracted and its credentials set here.
+    case_data_provider: str = "mock"
+    case_data_api_key: str = ""
+    case_data_api_base_url: str = ""
+
+    # Notifications (Hearing Reminders / Smart Notifications). Left blank ->
+    # notification_dispatch logs instead of sending (safe local-dev default).
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from_address: str = "no-reply@lawweb.local"
+    fcm_service_account_json: str = ""
+
+    # Legal Document Vault object storage (Cloudflare R2, S3-compatible).
+    # If unset, vault falls back to local disk under app/data/vault/ so the
+    # feature is testable without live R2 credentials — see
+    # app/services/object_storage.py.
+    r2_account_id: str = ""
+    r2_access_key_id: str = ""
+    r2_secret_access_key: str = ""
+    r2_bucket_name: str = "lawweb-vault"
+    r2_endpoint_url: str = ""
+
+    # OpenRouter (LLM-as-judge for RAG evaluation — see app/metrics/llm_judge.py)
+    openrouter_api_key: str = ""
+    # Free-tier model; check https://openrouter.ai/models?max_price=0 for the
+    # current catalog since free model availability rotates.
+    openrouter_model: str = "openai/gpt-oss-20b:free"
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    # OpenRouter free models: 20 req/min, 50 req/day (1000/day once the
+    # account has $10+ in lifetime credit purchases). Bump via env var
+    # after topping up rather than editing this default.
+    openrouter_daily_limit: int = 50
+
+    # HuggingFace access token (IL-TUR benchmark dataset is gated — see
+    # app/metrics/iltur_loader.py). Accept the license at
+    # https://huggingface.co/datasets/Exploration-Lab/IL-TUR and generate a
+    # token at https://huggingface.co/settings/tokens.
+    huggingface_token: str = ""
+
+    # Performance settings
+    max_document_size_mb: int = 10
+    cache_ttl_seconds: int = 3600
+
+    # Multilingual support. Pipeline: detect language (fastText) → translate
+    # query → English → run the existing English RAG/Qwen pipeline → translate
+    # the English answer back to the user's language. Conversation memory stays
+    # canonical-English. When disabled, the pipeline is a zero-overhead no-op
+    # (no models load) and behaviour is identical to the English-only chatbot.
+    multilingual_enabled: bool = True
+    language_detector: str = "fasttext"
+    # fastText language-id model (lid.176.bin, ~126MB). Path is resolved
+    # relative to the server CWD, matching the data-path convention.
+    lang_detect_model_path: str = "app/data/models/lid.176.bin"
+    # Below this fastText confidence, assume the default language rather than
+    # trust a shaky guess — short/code-mixed inputs are unreliable.
+    lang_detect_min_confidence: float = 0.55
+    default_language: str = "en"
+    # IndicTrans2 distilled 200M checkpoints, one per direction, served via
+    # CTranslate2. These are the non-gated CTranslate2 conversions of Raj Dabre's
+    # rotary IndicTrans2 distilled models: they need no transformers modeling code
+    # (which is incompatible with the transformers 5.x this stack runs on) and no
+    # HuggingFace gating. Distilled keeps RAM ~0.5GB/direction. Runs on CPU by
+    # default so the 4GB VRAM stays free for Ollama's LLM offload.
+    translation_model_indic_en: str = "adalat-ai/ct2-rotary-indictrans2-indic-en-dist-200M"
+    translation_model_en_indic: str = "adalat-ai/ct2-rotary-indictrans2-en-indic-dist-200M"
+    translation_device: str = "cpu"  # "auto" | "cuda" | "cpu"
+    translation_cache: bool = True
+
+    class Config:
+        env_file = ".env"
+        extra = "ignore"
+
+    @property
+    def port(self) -> int:
+        """Return the Python server port."""
+        return self.python_port
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        """Parse the comma-separated CORS origins into a list."""
+        return [o.strip() for o in self.cors_allow_origins.split(",") if o.strip()]
+
+
+@lru_cache()
+def get_settings() -> Settings:
+    """Get cached settings instance."""
+    return Settings()
