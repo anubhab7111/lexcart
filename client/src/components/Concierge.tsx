@@ -236,70 +236,86 @@ export function Concierge({ user, onNavigate, onDone }: Props) {
       <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
         {loadingHistory ? (
           <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
-            <div className="spinner" style={{ width: 22, height: 22 }} />
+            <div style={{ display: "flex", gap: 4 }}>
+              {[0, 1, 2].map((i) => (
+                <span key={i} style={{ width: 6, height: 6, borderRadius: 99, background: "var(--faint)", display: "inline-block", animation: `lw-dotPulse 1.2s infinite ${i * 0.15}s` }} />
+              ))}
+            </div>
           </div>
         ) : (
-        <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: "26px 8%" }}>
-          {messages.map((m) => (
-            <div key={m.id} className="fade-up" style={{ display: "flex", gap: 12, marginBottom: 18, flexDirection: m.role === "user" ? "row-reverse" : "row" }}>
-              <div className="avatar" style={{ width: 34, height: 34, flex: "none", background: m.role === "user" ? "var(--surface-alt)" : "var(--accent)", color: m.role === "user" ? "var(--text)" : "#fff", fontSize: 13 }}>
-                {m.role === "user" ? initials(user?.name || "You") : "⚡"}
-              </div>
-              <div style={{ maxWidth: "72%" }}>
-                <div style={{ background: m.role === "user" ? "var(--accent)" : "var(--surface-alt)", color: m.role === "user" ? "#fff" : "var(--text)", borderRadius: 14, padding: "11px 15px", font: "400 14px/1.55 var(--font-body)" }}>
-                  {m.text}
-                </div>
-                {m.lawyers && m.lawyers.length > 0 && (
-                  <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 10 }}>
-                    {m.lawyers.map((l) => {
-                      const tint = avatarTint(l.name);
-                      return (
-                        <div key={l.id} className="card" style={{ display: "flex", gap: 12, alignItems: "center", padding: 12 }}>
-                          <div className="avatar" style={{ width: 40, height: 40, background: tint.bg, color: tint.fg }}>{initials(l.name)}</div>
-                          <div style={{ flex: 1, minWidth: 0 }}>
-                            <div style={{ font: "700 13.5px var(--font-head)" }}>{l.name}</div>
-                            <div style={{ font: "500 12px var(--font-body)", color: "var(--muted-2)" }}>
-                              {l.specialty} · ★{l.rating} · {formatMoney(l.hourlyRate)}
+        <div ref={scrollRef} style={{ flex: 1, overflow: "auto", display: "flex", justifyContent: "center" }}>
+          <div style={{ width: "100%", maxWidth: 720, padding: "48px 24px 24px", display: "flex", flexDirection: "column", gap: 32 }}>
+            {messages.map((m) => (m.role === "user" ? (
+              <div key={m.id} style={{ alignSelf: "flex-end", maxWidth: "72%", background: "var(--user-bubble-bg)", color: "var(--user-bubble-fg)", padding: "14px 18px", borderRadius: 18, font: "400 15px/1.6 var(--font-body)", whiteSpace: "pre-wrap" }}>{m.text}</div>
+            ) : (
+              <div key={m.id} className="fade-up" style={{ display: "flex", gap: 12 }}>
+                <div style={{ width: 30, height: 30, flex: "none", borderRadius: 9, background: "var(--accent)", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", font: "700 13px var(--font-head)" }}>L</div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ font: "600 13px var(--font-body)", color: "var(--muted-2)", marginBottom: 6 }}>LexCart Concierge</div>
+                  <div style={{ font: "400 16px/1.75 var(--font-body)", color: "var(--text-strong)", whiteSpace: "pre-wrap" }}>{m.text}</div>
+                  {m.lawyers && m.lawyers.length > 0 && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 16 }}>
+                      {m.lawyers.map((l) => {
+                        const tint = avatarTint(l.name);
+                        return (
+                          <div key={l.id} className="card" style={{ display: "flex", gap: 14, alignItems: "center" }}>
+                            <div className="avatar" style={{ width: 46, height: 46, background: tint.bg, color: tint.fg }}>{initials(l.name)}</div>
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <div style={{ font: "700 14.5px var(--font-head)" }}>{l.name}</div>
+                              <div style={{ font: "500 12.5px var(--font-body)", color: "var(--muted-2)" }}>
+                                {l.specialty} · ★{l.rating} · {formatMoney(l.hourlyRate)}
+                              </div>
                             </div>
+                            <button className="btn btn-primary btn-sm" onClick={() => send(`Go with ${l.name}`)}>Select</button>
                           </div>
-                          <button className="btn btn-primary btn-sm" onClick={() => send(`Go with ${l.name}`)}>Select</button>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
               </div>
-            </div>
-          ))}
-          {busy && (
-            <div style={{ display: "flex", gap: 10, alignItems: "center", color: "var(--muted-2)", font: "500 13px var(--font-body)" }}>
-              <div className="spinner" style={{ width: 16, height: 16 }} /> The concierge is thinking…
-            </div>
-          )}
+            )))}
+            {busy && (
+              <div style={{ display: "flex", gap: 12 }}>
+                <div style={{ width: 30, height: 30, flex: "none", borderRadius: 9, background: "var(--accent)", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", font: "700 13px var(--font-head)" }}>L</div>
+                <div style={{ display: "flex", gap: 4, padding: "10px 0" }}>
+                  {[0, 1, 2].map((i) => (
+                    <span key={i} style={{ width: 6, height: 6, borderRadius: 99, background: "var(--faint)", display: "inline-block", animation: `lw-dotPulse 1.2s infinite ${i * 0.15}s` }} />
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
         </div>
         )}
 
-        {suggestions.length > 0 && !busy && (
-          <div style={{ display: "flex", gap: 8, padding: "0 8% 10px", flexWrap: "wrap" }}>
-            {suggestions.map((s) => (
-              <button key={s} className="chip" onClick={() => send(s)}>{s}</button>
-            ))}
+        {/* composer */}
+        <div style={{ display: "flex", justifyContent: "center", padding: "0 24px 22px", flex: "none" }}>
+          <div style={{ width: "100%", maxWidth: 720 }}>
+            {suggestions.length > 0 && !busy && (
+              <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+                {suggestions.map((s) => (
+                  <button key={s} className="chip" onClick={() => send(s)}>{s}</button>
+                ))}
+              </div>
+            )}
+            <form
+              onSubmit={(e) => { e.preventDefault(); send(input); }}
+              style={{ display: "flex", alignItems: "flex-end", gap: 10, background: "var(--surface)", border: "1px solid var(--border-2)", borderRadius: 18, padding: "12px 12px 12px 18px", boxShadow: "var(--shadow-soft)" }}
+            >
+              <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(input); } }}
+                placeholder={user ? "Describe your legal need, or say 'checkout'…" : "Sign in to shop with the concierge"}
+                disabled={!user || busy}
+                rows={1}
+                style={{ flex: 1, border: "none", outline: "none", resize: "none", background: "transparent", font: "400 15px/1.5 var(--font-body)", color: "var(--text)", maxHeight: 160 }}
+              />
+              <button type="submit" className="composer-send" title="Send" disabled={busy || !user}>↑</button>
+            </form>
           </div>
-        )}
-
-        <form
-          onSubmit={(e) => { e.preventDefault(); send(input); }}
-          style={{ display: "flex", gap: 10, padding: "12px 8% 22px", borderTop: "1px solid var(--border)" }}
-        >
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder={user ? "Describe your legal need, or say 'checkout'…" : "Sign in to shop with the concierge"}
-            disabled={!user || busy}
-            style={{ flex: 1, border: "1px solid var(--border)", borderRadius: 12, padding: "12px 16px", font: "400 14px var(--font-body)", background: "var(--surface)" }}
-          />
-          <button type="submit" className="composer-send" title="Send" disabled={busy}>↑</button>
-        </form>
+        </div>
       </div>
 
       {/* cart / gate column */}
