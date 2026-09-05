@@ -90,7 +90,7 @@ export function SimilarCaseSearch() {
             >
               {loading ? "Analyzing…" : "Search from text"}
             </button>
-            <button className="btn" disabled={loading} onClick={() => fileInput.current?.click()}>
+            <button className="btn btn-outline" disabled={loading} onClick={() => fileInput.current?.click()}>
               Upload file instead
             </button>
             <input
@@ -106,14 +106,14 @@ export function SimilarCaseSearch() {
           </div>
         </div>
 
-        {error && <div className="card" style={{ borderColor: "#f0d9d6", color: "var(--danger)", marginBottom: 18 }}>{error}</div>}
-        {loading && <div className="shimmer" style={{ height: 160, borderRadius: 16 }} />}
+        {error && <div className="error-banner" style={{ marginBottom: 18 }}>{error}</div>}
+        {loading && <div className="shimmer" style={{ height: 160, borderRadius: "var(--r-lg)" }} />}
 
         {result && !loading && (
           <>
             <div className="card" style={{ padding: "18px 20px", marginBottom: 18 }}>
               <div className="section-label">Extracted summary</div>
-              <p style={{ font: "400 13.5px var(--font-body)", color: "var(--text-2)" }}>{result.firac.facts || "—"}</p>
+              <p className="prose" style={{ font: "400 15.5px var(--font-serif)", color: "var(--text-2)" }}>{result.firac.facts || "—"}</p>
               {result.firac.issues.length > 0 && (
                 <>
                   <div style={{ font: "600 12px var(--font-body)", color: "var(--muted-3)", marginTop: 10 }}>Legal issues</div>
@@ -131,9 +131,9 @@ export function SimilarCaseSearch() {
                   {result.similarSupremeCourtCases.map((c, i) => (
                     <div key={i} className="card" style={{ padding: "14px 16px" }}>
                       <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-                        <div style={{ font: "600 13.5px var(--font-body)" }}>{c.caseName}</div>
+                        <div className="cite" style={{ font: "600 13.5px var(--font-body)" }}>{c.caseName}</div>
                         {c.score > 0 && (
-                          <div style={{ font: "600 11px var(--font-body)", color: "var(--muted-3)", whiteSpace: "nowrap" }}>
+                          <div className="mono-num" style={{ font: "600 11px var(--font-body)", color: "var(--muted-3)", whiteSpace: "nowrap" }}>
                             match {Math.round(c.score * 100)}%
                           </div>
                         )}

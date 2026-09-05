@@ -363,7 +363,7 @@ export function Concierge({ user, onNavigate, onDone }: Props) {
         )}
 
         {error && (
-          <div style={{ background: "#fbecea", color: "var(--danger)", borderRadius: 10, padding: "10px 12px", font: "500 12.5px var(--font-body)", marginTop: 12 }}>
+          <div className="error-banner" style={{ marginTop: 12 }}>
             {error}
           </div>
         )}
