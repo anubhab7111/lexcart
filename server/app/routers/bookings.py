@@ -100,6 +100,17 @@ def verify_checkout(
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
+    # The Razorpay webhook can beat checkout.js's own success callback to
+    # this order (both carry a genuinely successful payment). If that
+    # already happened, the payment succeeded and the booking already
+    # exists -- replay that same success instead of erroring on a race
+    # the user did nothing wrong to trigger.
+    existing = session.get(Order, body.orderId)
+    if existing is not None and existing.user_id == current_user.id and existing.status == OrderStatus.paid:
+        booking = session.get(Booking, existing.booking_id) if existing.booking_id else None
+        if booking is not None:
+            return {"status": "success", "transactionId": booking.transaction_id, "bookingId": booking.id}
+
     try:
         order = get_order_for_update(session, body.orderId, user_id=current_user.id)
     except CartError as e:
